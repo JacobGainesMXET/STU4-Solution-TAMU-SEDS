@@ -1,0 +1,17 @@
+{
+  "evidence": "90 degree ideal rigid body with installed allocator, fixed world thrust, no debris or translation integration; not Space Teams",
+  "results": {
+    "previous": {
+      "first_within_5_deg_s": 50.0,
+      "peak_spin_deg_s": 2.8998099764535494,
+      "final_nose_deg": 17.121000807988743,
+      "fuel_over_120_s": 82.90621091029247
+    },
+    "adaptive": {
+      "first_within_5_deg_s": 31.200000000000003,
+      "peak_spin_deg_s": 3.766215597694548,
+      "final_nose_deg": 1.0339825332532084,
+      "fuel_over_120_s": 60.2438427392058
+    }
+  }
+}

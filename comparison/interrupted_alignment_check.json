@@ -1,0 +1,15 @@
+{
+  "evidence": "Allocator/rigid-body check with early avoidance interrupting clear thrust.\n\nExecutes only the attitude statements extracted from each controller, never its\nsimulator integration. Prescribed translation: clear 0-12 s, nonurgent avoidance\n12-40 s, then clear. Avoidance alternates lateral firing and translation-off.\nNo debris/position integration: this is not a Space Teams run or a mission replay.\n",
+  "results": {
+    "previous": {
+      "first_within_12_deg_s": 57.800000000000004,
+      "peak_spin_deg_s": 3.180522712349557,
+      "final_nose_deg": 1.9353263665871343
+    },
+    "revised": {
+      "first_within_12_deg_s": 32.0,
+      "peak_spin_deg_s": 4.062571529885072,
+      "final_nose_deg": 3.0535794273704706
+    }
+  }
+}

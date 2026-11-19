@@ -1,0 +1,449 @@
+{
+  "evidence": "Damped shallow-turn check using extracted controller code and actual allocator math.\n\nIdeal rigid-body attitude with prescribed rear thrust, fixed target and requested\ncourse. No translational/debris integration; not a Space Teams run or mission replay.\n",
+  "results": [
+    {
+      "lateral_axis": 1,
+      "requested_deg": 5.0,
+      "within_two_deg_s": 10.3,
+      "peak_spin_deg_s": 0.448,
+      "max_forecast_lead_deg": 0.0,
+      "final_error_deg": 0.874,
+      "timeline": [
+        {
+          "t": 0.0,
+          "error_deg": 5.0
+        },
+        {
+          "t": 2.0,
+          "error_deg": 4.867
+        },
+        {
+          "t": 4.0,
+          "error_deg": 4.134
+        },
+        {
+          "t": 6.0,
+          "error_deg": 3.267
+        },
+        {
+          "t": 8.0,
+          "error_deg": 2.563
+        },
+        {
+          "t": 10.0,
+          "error_deg": 2.053
+        },
+        {
+          "t": 12.0,
+          "error_deg": 1.732
+        },
+        {
+          "t": 14.0,
+          "error_deg": 1.443
+        },
+        {
+          "t": 16.0,
+          "error_deg": 1.153
+        },
+        {
+          "t": 18.0,
+          "error_deg": 0.864
+        },
+        {
+          "t": 20.0,
+          "error_deg": 0.574
+        },
+        {
+          "t": 22.0,
+          "error_deg": 0.285
+        },
+        {
+          "t": 24.0,
+          "error_deg": 0.007
+        },
+        {
+          "t": 26.0,
+          "error_deg": 0.295
+        },
+        {
+          "t": 28.0,
+          "error_deg": 0.584
+        },
+        {
+          "t": 30.0,
+          "error_deg": 0.874
+        }
+      ]
+    },
+    {
+      "lateral_axis": 1,
+      "requested_deg": 12.0,
+      "within_two_deg_s": 16.5,
+      "peak_spin_deg_s": 1.164,
+      "max_forecast_lead_deg": 0.0,
+      "final_error_deg": 0.024,
+      "timeline": [
+        {
+          "t": 0.0,
+          "error_deg": 12.0
+        },
+        {
+          "t": 2.0,
+          "error_deg": 11.808
+        },
+        {
+          "t": 4.0,
+          "error_deg": 10.68
+        },
+        {
+          "t": 6.0,
+          "error_deg": 8.592
+        },
+        {
+          "t": 8.0,
+          "error_deg": 6.394
+        },
+        {
+          "t": 10.0,
+          "error_deg": 4.684
+        },
+        {
+          "t": 12.0,
+          "error_deg": 3.472
+        },
+        {
+          "t": 14.0,
+          "error_deg": 2.644
+        },
+        {
+          "t": 16.0,
+          "error_deg": 2.088
+        },
+        {
+          "t": 18.0,
+          "error_deg": 1.746
+        },
+        {
+          "t": 20.0,
+          "error_deg": 1.452
+        },
+        {
+          "t": 22.0,
+          "error_deg": 1.157
+        },
+        {
+          "t": 24.0,
+          "error_deg": 0.862
+        },
+        {
+          "t": 26.0,
+          "error_deg": 0.567
+        },
+        {
+          "t": 28.0,
+          "error_deg": 0.272
+        },
+        {
+          "t": 30.0,
+          "error_deg": 0.024
+        }
+      ]
+    },
+    {
+      "lateral_axis": 1,
+      "requested_deg": 20.0,
+      "within_two_deg_s": 18.7,
+      "peak_spin_deg_s": 2.008,
+      "max_forecast_lead_deg": 0.0,
+      "final_error_deg": 0.367,
+      "timeline": [
+        {
+          "t": 0.0,
+          "error_deg": 20.0
+        },
+        {
+          "t": 2.0,
+          "error_deg": 19.575
+        },
+        {
+          "t": 4.0,
+          "error_deg": 17.468
+        },
+        {
+          "t": 6.0,
+          "error_deg": 13.934
+        },
+        {
+          "t": 8.0,
+          "error_deg": 10.064
+        },
+        {
+          "t": 10.0,
+          "error_deg": 7.064
+        },
+        {
+          "t": 12.0,
+          "error_deg": 5.015
+        },
+        {
+          "t": 14.0,
+          "error_deg": 3.652
+        },
+        {
+          "t": 16.0,
+          "error_deg": 2.75
+        },
+        {
+          "t": 18.0,
+          "error_deg": 2.154
+        },
+        {
+          "t": 20.0,
+          "error_deg": 1.793
+        },
+        {
+          "t": 22.0,
+          "error_deg": 1.508
+        },
+        {
+          "t": 24.0,
+          "error_deg": 1.222
+        },
+        {
+          "t": 26.0,
+          "error_deg": 0.937
+        },
+        {
+          "t": 28.0,
+          "error_deg": 0.652
+        },
+        {
+          "t": 30.0,
+          "error_deg": 0.367
+        }
+      ]
+    },
+    {
+      "lateral_axis": 2,
+      "requested_deg": 5.0,
+      "within_two_deg_s": 10.3,
+      "peak_spin_deg_s": 0.448,
+      "max_forecast_lead_deg": 0.0,
+      "final_error_deg": 0.873,
+      "timeline": [
+        {
+          "t": 0.0,
+          "error_deg": 5.0
+        },
+        {
+          "t": 2.0,
+          "error_deg": 4.866
+        },
+        {
+          "t": 4.0,
+          "error_deg": 4.131
+        },
+        {
+          "t": 6.0,
+          "error_deg": 3.264
+        },
+        {
+          "t": 8.0,
+          "error_deg": 2.561
+        },
+        {
+          "t": 10.0,
+          "error_deg": 2.052
+        },
+        {
+          "t": 12.0,
+          "error_deg": 1.731
+        },
+        {
+          "t": 14.0,
+          "error_deg": 1.442
+        },
+        {
+          "t": 16.0,
+          "error_deg": 1.152
+        },
+        {
+          "t": 18.0,
+          "error_deg": 0.863
+        },
+        {
+          "t": 20.0,
+          "error_deg": 0.574
+        },
+        {
+          "t": 22.0,
+          "error_deg": 0.284
+        },
+        {
+          "t": 24.0,
+          "error_deg": 0.005
+        },
+        {
+          "t": 26.0,
+          "error_deg": 0.294
+        },
+        {
+          "t": 28.0,
+          "error_deg": 0.584
+        },
+        {
+          "t": 30.0,
+          "error_deg": 0.873
+        }
+      ]
+    },
+    {
+      "lateral_axis": 2,
+      "requested_deg": 12.0,
+      "within_two_deg_s": 16.400000000000002,
+      "peak_spin_deg_s": 1.165,
+      "max_forecast_lead_deg": 0.0,
+      "final_error_deg": 0.047,
+      "timeline": [
+        {
+          "t": 0.0,
+          "error_deg": 12.0
+        },
+        {
+          "t": 2.0,
+          "error_deg": 11.807
+        },
+        {
+          "t": 4.0,
+          "error_deg": 10.674
+        },
+        {
+          "t": 6.0,
+          "error_deg": 8.582
+        },
+        {
+          "t": 8.0,
+          "error_deg": 6.385
+        },
+        {
+          "t": 10.0,
+          "error_deg": 4.676
+        },
+        {
+          "t": 12.0,
+          "error_deg": 3.466
+        },
+        {
+          "t": 14.0,
+          "error_deg": 2.64
+        },
+        {
+          "t": 16.0,
+          "error_deg": 2.086
+        },
+        {
+          "t": 18.0,
+          "error_deg": 1.753
+        },
+        {
+          "t": 20.0,
+          "error_deg": 1.469
+        },
+        {
+          "t": 22.0,
+          "error_deg": 1.184
+        },
+        {
+          "t": 24.0,
+          "error_deg": 0.9
+        },
+        {
+          "t": 26.0,
+          "error_deg": 0.616
+        },
+        {
+          "t": 28.0,
+          "error_deg": 0.331
+        },
+        {
+          "t": 30.0,
+          "error_deg": 0.047
+        }
+      ]
+    },
+    {
+      "lateral_axis": 2,
+      "requested_deg": 20.0,
+      "within_two_deg_s": 18.7,
+      "peak_spin_deg_s": 2.006,
+      "max_forecast_lead_deg": 0.0,
+      "final_error_deg": 0.366,
+      "timeline": [
+        {
+          "t": 0.0,
+          "error_deg": 20.0
+        },
+        {
+          "t": 2.0,
+          "error_deg": 19.572
+        },
+        {
+          "t": 4.0,
+          "error_deg": 17.448
+        },
+        {
+          "t": 6.0,
+          "error_deg": 13.908
+        },
+        {
+          "t": 8.0,
+          "error_deg": 10.044
+        },
+        {
+          "t": 10.0,
+          "error_deg": 7.051
+        },
+        {
+          "t": 12.0,
+          "error_deg": 5.007
+        },
+        {
+          "t": 14.0,
+          "error_deg": 3.647
+        },
+        {
+          "t": 16.0,
+          "error_deg": 2.747
+        },
+        {
+          "t": 18.0,
+          "error_deg": 2.151
+        },
+        {
+          "t": 20.0,
+          "error_deg": 1.791
+        },
+        {
+          "t": 22.0,
+          "error_deg": 1.506
+        },
+        {
+          "t": 24.0,
+          "error_deg": 1.221
+        },
+        {
+          "t": 26.0,
+          "error_deg": 0.936
+        },
+        {
+          "t": 28.0,
+          "error_deg": 0.651
+        },
+        {
+          "t": 30.0,
+          "error_deg": 0.366
+        }
+      ]
+    }
+  ]
+}

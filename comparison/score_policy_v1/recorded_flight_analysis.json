@@ -1,0 +1,62 @@
+{
+  "source": "STU4-Solution-TAMU-SEDS\\diagnostics\\20261119T011253_713806Z",
+  "evidence": "Recorded Space Teams telemetry, old score/coast policy",
+  "caveat": "Fuel grouped by adjacent one-second mode snapshots; this does not exactly separate rotational/translational fuel",
+  "interval_summary": {
+    "ACQUIRE": {
+      "seconds": 2.0629790000000003,
+      "fuel": 0.0,
+      "snapshots": 2,
+      "linear_on": 0,
+      "angular_on": 0
+    },
+    "BURN": {
+      "seconds": 51.807082,
+      "fuel": 26.02163261470706,
+      "snapshots": 50,
+      "linear_on": 48,
+      "angular_on": 15
+    },
+    "AVOID": {
+      "seconds": 94.96524099999999,
+      "fuel": 44.97124054660939,
+      "snapshots": 91,
+      "linear_on": 50,
+      "angular_on": 46
+    },
+    "CORRECT": {
+      "seconds": 23.81067399999999,
+      "fuel": 9.567330422867308,
+      "snapshots": 22,
+      "linear_on": 6,
+      "angular_on": 14
+    },
+    "COAST": {
+      "seconds": 190.10172200000002,
+      "fuel": 75.40961171988157,
+      "snapshots": 176,
+      "linear_on": 1,
+      "angular_on": 120
+    },
+    "EMERGENCY": {
+      "seconds": 8.465210000000013,
+      "fuel": 4.218104405972824,
+      "snapshots": 8,
+      "linear_on": 8,
+      "angular_on": 5
+    },
+    "ARRIVED": {
+      "seconds": 10.08975799999996,
+      "fuel": 0.0,
+      "snapshots": 10,
+      "linear_on": 0,
+      "angular_on": 0
+    }
+  },
+  "first_recorded_arrival": {
+    "t": "399.139781",
+    "fuel": "171.68951954913717",
+    "damage": "0.0",
+    "score_if_arrived": "-148.85470392919095"
+  }
+}

@@ -89,3 +89,6 @@ TAGS
 
 # VSCode's meta files
 **/.vscode/**
+
+# Local flight telemetry; preserve on disk for analysis without adding it to Git.
+/diagnostics/

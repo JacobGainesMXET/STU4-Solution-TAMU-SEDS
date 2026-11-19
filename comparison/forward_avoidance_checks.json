@@ -1,0 +1,103 @@
+{
+  "evidence": "Synthetic point-mass, constant gravity, ideal fuel and instantaneous attitude; NOT Space Teams or a replay. The plant uses constant .14 m/s^2 and omits axis-dependent jet authority and attitude fuel.",
+  "scenarios": {
+    "clear": {
+      "before": {
+        "arrived": true,
+        "time": 191.1,
+        "fuel": 35.7,
+        "ideal_score": 65.19,
+        "min_true_gap": null,
+        "coast_fraction": 0.691,
+        "collision": false,
+        "avoidance_plans": 0,
+        "avoidance_strategies": {
+          "GUIDANCE": 765
+        }
+      },
+      "forward_avoidance": {
+        "arrived": true,
+        "time": 191.1,
+        "fuel": 35.7,
+        "ideal_score": 65.19,
+        "min_true_gap": null,
+        "coast_fraction": 0.691,
+        "collision": false,
+        "avoidance_plans": 0,
+        "avoidance_strategies": {
+          "GUIDANCE": 765
+        }
+      }
+    },
+    "head_on": {
+      "before": {
+        "arrived": true,
+        "time": 194.1,
+        "fuel": 39.48,
+        "ideal_score": 59.18,
+        "min_true_gap": 16.01,
+        "coast_fraction": 0.664,
+        "collision": false,
+        "avoidance_plans": 84,
+        "avoidance_strategies": {
+          "GUIDANCE": 693,
+          "AVOID": 84
+        }
+      },
+      "forward_avoidance": {
+        "arrived": true,
+        "time": 193.55,
+        "fuel": 40.3,
+        "ideal_score": 58.26,
+        "min_true_gap": 17.05,
+        "coast_fraction": 0.656,
+        "collision": false,
+        "avoidance_plans": 63,
+        "avoidance_strategies": {
+          "GUIDANCE": 712,
+          "FORWARD": 31,
+          "COAST": 1,
+          "ESCAPE": 31
+        }
+      }
+    },
+    "crossing": {
+      "before": {
+        "arrived": true,
+        "time": 196.0,
+        "fuel": 42.72,
+        "ideal_score": 54.26,
+        "min_true_gap": 9.64,
+        "coast_fraction": 0.64,
+        "collision": false,
+        "avoidance_plans": 131,
+        "avoidance_strategies": {
+          "GUIDANCE": 653,
+          "AVOID": 117,
+          "CAUTION": 14
+        }
+      },
+      "forward_avoidance": {
+        "arrived": true,
+        "time": 193.75,
+        "fuel": 44.2,
+        "ideal_score": 53.0,
+        "min_true_gap": 10.15,
+        "coast_fraction": 0.623,
+        "collision": false,
+        "avoidance_plans": 115,
+        "avoidance_strategies": {
+          "GUIDANCE": 660,
+          "FORWARD": 53,
+          "COAST": 2,
+          "ESCAPE": 60
+        }
+      }
+    }
+  },
+  "synthetic_500_track_planning": {
+    "tracks_after_broadphase": 133,
+    "candidates": 120,
+    "milliseconds": 161.41
+  }
+}

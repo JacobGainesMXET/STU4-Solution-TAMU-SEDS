@@ -1,0 +1,43 @@
+{
+  "evidence": "Synthetic point-mass, constant gravity, ideal fuel, instantaneous attitude; not Space Teams",
+  "previous_clear": {
+    "arrived": true,
+    "time": 188.05,
+    "fuel": 37.49,
+    "ideal_score": 63.83,
+    "min_true_gap": null,
+    "coast_fraction": 0.671,
+    "collision": false,
+    "avoidance_plans": 0
+  },
+  "revised_clear": {
+    "arrived": true,
+    "time": 163.25,
+    "fuel": 45.08,
+    "ideal_score": 63.4,
+    "min_true_gap": null,
+    "coast_fraction": 0.544,
+    "collision": false,
+    "avoidance_plans": 0
+  },
+  "revised_head_on": {
+    "arrived": true,
+    "time": 144.0,
+    "fuel": 76.88,
+    "ideal_score": 30.83,
+    "min_true_gap": 14.83,
+    "coast_fraction": 0.118,
+    "collision": false,
+    "avoidance_plans": 84
+  },
+  "revised_crossing": {
+    "arrived": true,
+    "time": 178.15,
+    "fuel": 47.74,
+    "ideal_score": 53.7,
+    "min_true_gap": 9.56,
+    "coast_fraction": 0.557,
+    "collision": false,
+    "avoidance_plans": 131
+  }
+}
