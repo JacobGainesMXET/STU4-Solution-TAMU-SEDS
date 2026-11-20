@@ -510,8 +510,9 @@ while not exit_flag:
             nominal = guidance.decide(relative_position, relative_velocity, gravity, now,
                                        fuel_used, roll_reference, nose=current_axes[0])
             route_started = time.perf_counter()
+            handoff = LAUNCH_PLAN_TIME <= now < LAUNCH_PLAN_TIME + 2.
             if ((no_debris_test_mode or tracker.fresh(now)) and not avoidance.active
-                    and np.linalg.norm(omega_body) <= MAX_TURN_RAD_S
+                    and (handoff or np.linalg.norm(omega_body) <= MAX_TURN_RAD_S)
                     and nominal.mode in ("ACCELERATE", "CLEAR_COAST")):
                 try:
                     nominal = routes.command(nominal, guidance, tracker.tracks.values(), now, loc,
@@ -549,9 +550,9 @@ while not exit_flag:
                                     transit_burn=(nominal.mode == "ACCELERATE" and
                                                   guidance.transit_reason == "score favors burn"),
                                     launch=launch, coast_only=guidance.distance_coast,
-                                    plan_on_coast=(LAUNCH_PLAN_TIME <= now < LAUNCH_PLAN_TIME + 2.
-                                                   and tracker.fresh(now) and routes.action is None
-                                                   and nominal.mode == "ACCELERATE"))
+                                    plan_on_coast=handoff and routes.action is None and nominal.mode == "ACCELERATE",
+                                    route_uncertain=(routes.path is None or bool(routes.direct_risk.unresolved)
+                                                     or routes.direct_risk.clearance < 2. * model.clearance))
             if plan.mode == "AVOID":
                 guidance.finish_burn(now)  # avoidance may preempt any scheduled nominal burn
                 routes.interrupt(now, "tactical override")
@@ -604,6 +605,11 @@ while not exit_flag:
     route_rear = (mode == "ACCELERATE" and routes.action is not None and routes.action.rear_burn)
     launch_burn = (mode == "ACCELERATE" and now < LAUNCH_PLAN_TIME) or angled_launch
     rear_burn = full_thrust and not launch_burn
+    # Lift away from the pad before asking for a faster pitch. Evaluate the
+    # same measured corridor in both scenarios, including radar freshness.
+    clear_departure = (launch_burn and mode == "ACCELERATE" and relative_velocity @ goal > .1
+                       and (no_debris_test_mode or tracker.fresh(now)) and plan is not None
+                       and plan.baseline.clearance >= 2. * model.clearance)
     pointing_axis = command / max(np.linalg.norm(command), 1e-12) if full_thrust else goal
     nose_error = math.acos(float(np.clip(current_axes[0] @ pointing_axis, -1., 1.)))
     nose_tolerance = math.radians(2.) if rear_burn else pointing_tolerance(distance, False)
@@ -611,8 +617,13 @@ while not exit_flag:
         alignment_engaged = False
     elif nose_error > nose_tolerance + math.radians(1. if rear_burn else 4.):
         alignment_engaged = True
+    # A new contact can arrive mid-slew. If spin currently rules out an angled
+    # escape, damp it first so the next radar decision regains that option.
+    recovery = np.linalg.norm(omega_body) > 2. * MAX_TURN_RAD_S
+    arrest_launch_turn = now < LAUNCH_PLAN_TIME and mode == "AVOID" and recovery
     # Use a coasting handoff or a blocked forward corridor to finish pointing.
     align_nose = (alignment_engaged and not quiet_coast and not mission_complete and not vector_escape
+                  and not arrest_launch_turn
                   and (full_thrust or mode in ("PLAN_COAST", "AVOID")))
     phase_priority = 1. if align_nose else 0.
     alignment_priority = alignment_strength(nose_error) * phase_priority
@@ -621,14 +632,19 @@ while not exit_flag:
                                                  priority=phase_priority)
     target_axes = MakeTargetAttitude(desired_forward, roll_reference)
     roll_reference = target_axes[1].copy()
-    recovery = np.linalg.norm(omega_body) > 2.0 * MAX_TURN_RAD_S
+    # At large errors the old slow slew spent extra propellant combining pitch
+    # with broadside lift. Taper the rate with pointing error and keep damping
+    # authority as the nose approaches the burn direction.
+    max_turn_accel = .05 if clear_departure else .03
+    rate_limit = math.radians(3. + (8. if clear_departure else 2.) * alignment_priority)
     alignment_limit = min(angular_limit, .03 if recovery else
-                          (.005 + .025 * alignment_priority if full_thrust else (.008 if align_nose else .005)))
+                          (.005 + (max_turn_accel - .005) * alignment_priority
+                           if full_thrust else (.008 if align_nose else .005)))
     braking_limit = min(angular_limit, .03 if recovery or full_thrust else (.008 if align_nose else .005))
     alpha_body, attitude_error = ComputeAttitudeAcceleration(
         current_axes, target_axes, omega_body, alignment_limit,
         gain_scale=1.0 + 2.0 * alignment_priority if full_thrust else .75,
-        rate_limit=math.radians(3.0 + 2.0 * alignment_priority), brake_limit=braking_limit,
+        rate_limit=rate_limit, brake_limit=braking_limit,
         # Drive into the acceptance cone, then disengage above. Using the same
         # tolerance for both would approach its boundary asymptotically forever.
         tolerance=.5 * nose_tolerance)
@@ -642,9 +658,7 @@ while not exit_flag:
         if no_debris_test_mode or tracker.fresh(now):
             # Once lift is established on a clear corridor, let the allocator
             # give more authority to rotation while sustaining outward thrust.
-            clear_lift = (not angled_launch and relative_velocity @ goal > .1 and plan is not None
-                          and plan.baseline.clearance >= 2. * model.clearance)
-            lift_request = min(.12, linear_limit) if clear_lift else linear_limit
+            lift_request = min(.12, linear_limit) if clear_departure else linear_limit
             linear_world = (pointing_axis if angled_launch else goal) * lift_request
     elif rear_burn and forward_ready:
         axis = current_axes[0]
@@ -692,7 +706,8 @@ while not exit_flag:
                           coast_arrival_s=None if mission_complete else guidance.coast_arrival,
                           route=routes.action.name if routes.action else "direct", route_reason=routes.reason,
                           cruise_reason=guidance.transit_reason if model.score_cruise else routes.cruise_reason,
-                          launch_burn=int(launch_burn),
+                          launch_burn=int(launch_burn), clear_departure=int(clear_departure),
+                          turn_rate_limit_deg_s=math.degrees(rate_limit),
                           pending_route=routes.pending.name if routes.pending is not None else '',
                           progress=1. - distance / max(guidance.launch_distance, 1e-9), distance_coast=int(guidance.distance_coast),
                           route_review_t=routes.review_time, route_ms=route_ms, route_unresolved=len(routes.risk.unresolved),

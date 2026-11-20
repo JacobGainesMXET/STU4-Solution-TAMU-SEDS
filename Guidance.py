@@ -977,7 +977,7 @@ class AvoidancePlanner:
 
     def choose(self, scene, nominal, velocity, goal, now, *, nose=None, allow_forward=True,
                nominal_burn_seconds=8., rear_guidance=False, launch=False, coast_only=False, plan_on_coast=False,
-               transit_burn=False):
+               transit_burn=False, route_uncertain=False):
         nominal = nonbraking(nominal, velocity, goal)
         if coast_only:
             nominal = np.zeros(3)
@@ -993,7 +993,10 @@ class AvoidancePlanner:
             self.active = self.forward_burn = False
             return AvoidanceDecision(nominal, 'GUIDANCE', baseline, baseline,
                                      strategy='DISTANCE_COAST' if coast_only else 'LAUNCH')
-        if plan_on_coast and velocity @ goal_axis > .5:
+        # A marginal near-term burn or an unresolved crossing farther along the
+        # route justifies a handoff pause. Check the coast itself before using it.
+        if (plan_on_coast and velocity @ goal_axis > .5
+                and (route_uncertain or baseline.clearance < 2. * self.model.clearance)):
             coast = scene.assess(np.zeros(3))
             if coast.clearance >= 0.:
                 self.active = self.forward_burn = False

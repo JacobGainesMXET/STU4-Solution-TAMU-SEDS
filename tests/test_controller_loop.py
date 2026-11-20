@@ -26,6 +26,8 @@ class StopLoop(Exception):
 
 
 class FakeSimulation:
+    phobos_mu_km3_s2 = 0.
+
     def __init__(self, failure=None, arrived=False, distance=1300., velocity=None, rotation=None,
                  radar_period=4., no_debris_test=False, spin=None, stop_at=14.):
         self.now = 0.
@@ -122,7 +124,7 @@ class FakeSimulation:
                              time=SimpleNamespace(sleep=self.sleep, perf_counter=lambda: self.now),
                              this=SimpleNamespace(GetParam=self.get_param,
                                                   HasParam=lambda key: key == 'NoDebrisTestMode' and self.no_debris_test),
-                             shuttle=shuttle, phobos=SimpleNamespace(GetParam=lambda *args: 0.),
+                             shuttle=shuttle, phobos=SimpleNamespace(GetParam=lambda *args: self.phobos_mu_km3_s2),
                              target=SimpleNamespace(getLocVelAcc=self.target_state),
                              phobosFrame=0, shuttleFrame=1, GetRadarContacts=self.radar,
                              SetCommand=lambda linear, angular: (self.set_param(0, ['CommandedAccel'], linear),
@@ -333,14 +335,35 @@ class ControllerLoopTests(unittest.TestCase):
         result = sim.run()
         self.assertTrue(result['launch_burn'])
         self.assertTrue(any(np.linalg.norm(a) > 0. for _, _, a in sim.commands))
-        self.assertTrue(all(np.linalg.norm(a) <= .03 + 1e-12
-                            for _, _, a in sim.commands))
+        self.assertTrue(result['clear_departure'])
+        self.assertTrue(all(np.linalg.norm(a) <= .05 + 1e-12 for _, _, a in sim.commands))
+        self.assertLessEqual(np.linalg.norm(sim.commands[0][2]), .03 + 1e-12)
         self.assertGreater(sim.velocity[0], 0.)
         lift = np.array([rotation @ linear for _, linear, _ in sim.commands])
         np.testing.assert_allclose(lift[:, 1:], 0., atol=1e-12)
         self.assertEqual(lift[0, 0], .5)
         self.assertEqual(lift[-1, 0], .12)
         self.assertTrue(np.all(np.isin(lift[:, 0], [.5, .12])))
+
+    def test_benign_radar_uses_same_launch_and_handoff_as_empty_field(self):
+        rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+        empty = FakeSimulation(rotation=rotation, no_debris_test=True, stop_at=24.)
+        clear = FakeSimulation(rotation=rotation, radar_period=.5, stop_at=24.)
+        empty.run()
+        clear.run()
+        self.assertGreater(clear.radar_reads, 0)
+        np.testing.assert_allclose([np.r_[t, a, b] for t, a, b in clear.commands],
+                                   [np.r_[t, a, b] for t, a, b in empty.commands], atol=1e-12)
+
+    def test_handoff_can_review_the_route_while_spin_still_inhibits_rear_thrust(self):
+        sim = FakeSimulation(velocity=[2., 0., 0.], spin=[0., .13, 0.],
+                             no_debris_test=True, stop_at=20.5)
+        sim.now = 20.
+        result = sim.run()
+        self.assertIsNotNone(result['routes'].review_time)
+        self.assertFalse(result['forward_ready'])
+        self.assertTrue(sim.commands)
+        self.assertTrue(all(np.linalg.norm(a) == 0. for _, a, _ in sim.commands))
 
     def test_nonurgent_avoidance_can_continue_coarse_alignment(self):
         rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
@@ -350,6 +373,18 @@ class ControllerLoopTests(unittest.TestCase):
         simulation.run(avoidance_decision=moderate)
         self.assertTrue(any(np.linalg.norm(angular) > 0. for _, _, angular in simulation.commands))
 
+    def test_new_launch_hazard_damps_a_fast_turn_before_resuming_aim(self):
+        rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+        sim = FakeSimulation(rotation=rotation, radar_period=.5, spin=[0., 0., .16])
+        hazard = AvoidanceDecision(np.zeros(3), 'AVOID', Encounter(clearance=1.),
+                                   Encounter(clearance=-2., time=3.))
+        result = sim.run(avoidance_decision=hazard)
+        self.assertTrue(result['arrest_launch_turn'])
+        for _, translation, angular in sim.commands:
+            np.testing.assert_array_equal(translation, np.zeros(3))
+            np.testing.assert_array_equal(angular[:2], np.zeros(2))
+            self.assertLess(angular @ sim.spin, 0.)
+
     def test_launch_uses_a_clear_angled_vector_even_from_a_broadside_pad(self):
         rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
         simulation = FakeSimulation(radar_period=.5, rotation=rotation)
@@ -358,6 +393,8 @@ class ControllerLoopTests(unittest.TestCase):
         with patch.object(PredictionScene, 'assess', assess):
             result = simulation.run()
         self.assertEqual(result['plan'].strategy, 'LAUNCH_TILT')
+        self.assertFalse(result['clear_departure'])
+        self.assertTrue(all(np.linalg.norm(a) <= .03 + 1e-12 for _, _, a in simulation.commands))
         self.assertLess(result['plan'].baseline.clearance, 0.)
         self.assertGreater(result['plan'].encounter.clearance, 0.)
         powered = [rotation @ linear for t, linear, _ in simulation.commands if np.linalg.norm(linear)]

@@ -1,5 +1,63 @@
 # STU4 controller and score audit
 
+## When another forward burn pays for itself
+
+The local final configuration sets nominal time to 120 s, nominal fuel to 75 kg, capture radius to 50 m and the damage limit to 209,200 J. For two successful profiles with equal damage, the score gained by changing from arrival time `T0` to `T1` with additional fuel `dF` is `12000*(1/T1 - 1/T0) - 100*dF/75`. For a positive expenditure the new arrival must beat `9000*T0/(9000 + dF*T0)`. Fuel already used cancels in the comparison.
+
+The six clean competition recordings below first entered score-driven clear coast at 75–118 s, with 907–1,058 m of range left and 6.35–7.17 m/s of closing speed. At each of those states I priced 0, 2, 4, 8, 12, 16 and 24 additional seconds of forward acceleration through first entry into the official sphere. Immediate coast had the highest predicted score at all six samples. These calculations hold the measured nose axis, gravity and learned acceleration and propellant cost constant and assume no subsequent maneuver or damage.
+
+In recording 054215 at 65.17 s, closing speed was 6.43 m/s. Eight more seconds of forward thrust cost a projected 5.65 kg and improved the predicted arrival from 269.84 to 225.62 s, gaining 1.18 points. A 24 s burn lost 1.93 points. At 82.91 s and 7.07 m/s, another 8 s cost 4.43 kg for a 22.76 s saving and lost 0.58 points. The actual flight encountered debris and arrived at 220.00 s. Reproduce both forecasts with the simulator Python from the team checkout.
+
+```powershell
+python -B tests/price_coast.py diagnostics/20261120T054215_625458Z --at 65 82.9
+```
+
+I also flew the alternatives on the head-on and crossing allocator scenes with matched radar seeds 7, 23, 41 and 101. Scores below are means of individual successful flight scores. Every policy arrived in all eight tests with a minimum modeled hull gap of 4.83 m.
+
+| Discretionary burn decision | Mean debris score | Debris-free score |
+|---|---:|---:|
+| Current 2 s burn versus coast | 50.53 | 58.58 |
+| Continue if any tested duration of 0.5, 2, 6 or 12 s beats coast | 50.44 | 58.74 |
+| Price a 6 s burn versus coast | 50.48 | 58.38 |
+| Price a 2 s burn along the measured nose when aligned | 50.52 | 58.77 |
+| Price first entry at 50 m, retain the inner capture margin for guidance | 50.52 | 58.65 |
+
+The alternatives used the existing attitude, radar and avoidance controllers. The largest difference in mean debris score was 0.10 point. These tests support retaining the current competition controller. They do not establish a global optimum in the full debris field.
+
+## Transit time at the current fuel consumption
+
+The team controller at `5ea242d` recorded six zero-damage arrivals in seven source-matched competition logs. The six averaged **252.41 s and 38.96 kg** to first measured entry into the 50 m sphere. The seventh log ended at 364.93 s with 445.52 m remaining and 6,794 J of damage. Its final competition outcome is unknown. The recording IDs below use the UTC start time on November 20, 2026.
+
+| Recording | Arrival (s) | Fuel at arrival (kg) | Fuel near 100 s (kg) | Extra distance flown (m) |
+|---|---:|---:|---:|---:|
+| 035118 | 259.02 | 40.06 | 35.09 | 5.2 |
+| 035405 | 236.91 | 38.00 | 37.97 | 15.8 |
+| 040031 | 280.28 | 35.89 | 35.79 | 2.6 |
+| 040808 | 250.74 | 39.07 | 36.74 | 16.1 |
+| 041616 | 267.52 | 38.54 | 34.07 | 17.5 |
+| 054215 | 220.00 | 42.18 | 37.36 | 0.5 |
+
+Extra distance is the sum of distances between successive target-relative positions minus the reduction in target range to first entry. The direct approach covered about 1,256 m. Position samples are roughly one second apart. By 100 s the six arrivals had spent 88–100% of their final fuel. In the 236.91 s flight the last recorded translation was around 74 s. The 267.52 s flight spent almost the same fuel but still needed course trims after 100 s and an avoidance burn around 245 s. The encounters differed, so the 30.61 s difference cannot be assigned to burn timing alone.
+
+### Matched allocator experiments
+
+Each comparison ran the controller loop with the installed jet allocation math, the same initial state, debris geometry and radar noise seed in both arms. The two debris layouts were `head-on` and `crossings` in `tests/check_launch_fuel.py`. The four-flight comparisons used seeds 7 and 23. The eight-flight comparisons also used 41 and 101. The plant models spherical hull clearance and omits contact dynamics and the launchpad.
+
+| Experiment | Comparison set | Mean time (s) | Mean total fuel (kg) |
+|---|---|---:|---:|
+| Current controller | Four debris flights | 198.15 | 45.85 |
+| Faster launch turn, raising the maximum requested rate from 5 to 8 degrees/s | Same four | 196.00 | 47.38 |
+| Suppress small torque commands during clear, nearly aligned main burns | Same four | 191.19 | 48.18 |
+| Allow a shorter radar-cleared forward pulse when the full two seconds cannot clear | Same four | 198.15 | 45.85 |
+| Correct lateral drift earlier using a longer coast prediction | Same four | 198.18 | 45.81 |
+| Current controller | Eight debris flights | 195.96 | 46.28 |
+| Stop discretionary acceleration at a projected 35 kg | Same eight | 194.40 | 46.66 |
+| Stop discretionary acceleration at a projected 36 kg | Same eight | 194.69 | 46.57 |
+
+The spending thresholds applied to discretionary acceleration. Collision avoidance and missed-intercept corrections could still consume fuel. All eight baseline and both sets of eight threshold flights arrived without modeled contact. The faster turn improved the clear run from 209.10 s / 36.60 kg to 207.30 s / 36.11 kg. In head-on seed 23 it saved 30.20 s at a cost of 9.71 kg. Under an identical 37 kg discretionary threshold the faster turn also improved the clear run from 210.10 s / 36.42 kg to 206.20 s / 36.29 kg. The same turn delayed crossing seed 7 by 23.20 s under that threshold.
+
+The tested changes did not establish a repeatable transit reduction at equal or lower total fuel in debris. The competition configuration continues to select the previously flown team controller. For a subsequent candidate, compare closing speed and fuel together at 60 and 100 s, then check total fuel, first-entry time and damage on the same encounters. Earlier useful forward impulse helps only if it can replace later expenditure while keeping the corridor clear.
+
 ## Current score optimization study
 
 The active team checkout contains a score-driven controller ready for Space Teams trials. Its predecessor is preserved byte-for-byte in [comparison/pre_score_optimization](comparison/pre_score_optimization). The source hashes in that snapshot match the team's latest time-target recordings. The earlier under-50-kg variant is in [comparison/pre_transit_target](comparison/pre_transit_target). The active behavior and results below supersede the historical phases further down this file.

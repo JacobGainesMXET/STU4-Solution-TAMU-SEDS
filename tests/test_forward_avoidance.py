@@ -189,13 +189,18 @@ class ForwardAvoidanceTests(unittest.TestCase):
             else:
                 self.assertIn(plan.strategy, ('COAST_LIMITED_CLEARANCE', 'FORWARD_LIMITED_CLEARANCE'))
 
-    def test_plan_on_coast_only_when_coast_is_clear_and_moving(self):
-        clear = self.scene([80., 60., 0.], [-4., 0., 0.])
+    def test_handoff_coasts_only_with_a_marginal_burn_and_a_clear_moving_coast(self):
+        clear = self.scene([80., 12., 0.], [-4., 0., 0.])
         planner = AvoidancePlanner(self.model)
         choice = planner.choose(clear, .09*self.goal, self.goal, self.goal, 20., plan_on_coast=True)
         self.assertEqual(choice.mode, 'PLAN_COAST')
         stopped = planner.choose(clear, .09*self.goal, self.zero, self.goal, 20., plan_on_coast=True)
         self.assertEqual(stopped.mode, 'GUIDANCE')
+        open_corridor = self.scene([80., 60., 0.], [-4., 0., 0.])
+        self.assertEqual(planner.choose(open_corridor, .09*self.goal, self.goal, self.goal,
+                                        20., plan_on_coast=True).mode, 'GUIDANCE')
+        self.assertEqual(planner.choose(open_corridor, .09*self.goal, self.goal, self.goal,
+                                        20., plan_on_coast=True, route_uncertain=True).mode, 'PLAN_COAST')
         blocked = self.scene([30., 0., 0.], [-4., 0., 0.])
         self.assertEqual(planner.choose(blocked, .09*self.goal, self.goal, self.goal, 20.,
                                         plan_on_coast=True).mode, 'AVOID')
