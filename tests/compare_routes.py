@@ -16,15 +16,15 @@ def load_module(path, name):
     return module
 
 
-def compare(seed=7, scene=None, fixed_speeds=False, as_flown=False):
-    snapshot = 'pre_forward_only' if as_flown else 'pre_early_routes'
+def compare(seed=7, scene=None, fixed_speeds=False, as_flown=False, before_score=False):
+    snapshot = 'pre_score_optimization' if before_score else ('pre_forward_only' if as_flown else 'pre_early_routes')
     saved = Path(__file__).resolve().parents[1] / 'comparison' / snapshot
     previous = load_module(saved / 'Guidance.py', snapshot + '_guidance')
     names = ('MissionModel', 'RadarTracker', 'AccelerationGuidance', 'AvoidancePlanner',
              'PredictionScene', 'StateHistory', 'PulseController', 'learn_burn_model')
     source = sim if fixed_speeds else previous
     controls = {key: getattr(source, key) for key in names}
-    if as_flown:
+    if as_flown or before_score:
         with patch.dict(sys.modules, Guidance=previous):
             controls['RoutePlanner'] = load_module(saved / 'RoutePlanner.py', snapshot + '_routes').RoutePlanner
     scenes = {
@@ -34,13 +34,18 @@ def compare(seed=7, scene=None, fixed_speeds=False, as_flown=False):
         'two crossings': [([655., 80., -15.], [0., -.7, .1]), ([755., -85., 4.], [0., .8, 0.])],
         'two slow drifters': [([540., -10., 5.], [0., .3, -.05]), ([612., -13., 6.], [0., .3, -.05])],
     }
+    if before_score:
+        scenes.update({'launch center': [([65., 0., 0.], [-.55, 0., 0.])],
+                       'launch crossing': [([42., 45., 0.], [0., -1.8, 0.])],
+                       'launch offset': [([85., -5., 0.], [-.8, .22, 0.])]})
     for name, rocks in scenes.items():
         if scene is not None and scene != name:
             continue
         with patch.multiple(sim, **controls):
-            before = sim.run(obstacles=rocks, seed=seed, plan_routes=as_flown)
-            lower_speed = None if as_flown else sim.run(obstacles=rocks, seed=seed, plan_routes=False, coast_speed=9.)
-        after = sim.run(obstacles=rocks, seed=seed, plan_routes=True)
+            before = sim.run(obstacles=rocks, seed=seed, plan_routes=as_flown or before_score,
+                             arrival_target=150. if before_score else None)
+            lower_speed = None if as_flown or before_score else sim.run(obstacles=rocks, seed=seed, plan_routes=False, coast_speed=9.)
+        after = sim.run(obstacles=rocks, seed=seed, plan_routes=True, score_cruise=True)
         yield name, before, lower_speed, after
 
 
@@ -51,10 +56,11 @@ if __name__ == '__main__':
     controls = parser.add_mutually_exclusive_group()
     controls.add_argument('--fixed-speeds', action='store_true', help='Use the current tracker for both fixed-speed controls.')
     controls.add_argument('--as-flown', action='store_true', help='Compare with the controller saved before forward-only avoidance.')
+    controls.add_argument('--before-score', action='store_true', help='Pair the saved time-target policy with the current score policy.')
     args = parser.parse_args()
     control = 'current fixed' if args.fixed_speeds else 'previous'
-    for name, before, lower_speed, after in compare(args.seed, args.scene, args.fixed_speeds, args.as_flown):
-        label_before = 'as flown' if args.as_flown else control + ' at 10'
+    for name, before, lower_speed, after in compare(args.seed, args.scene, args.fixed_speeds, args.as_flown, args.before_score):
+        label_before = 'time target' if args.before_score else ('as flown' if args.as_flown else control + ' at 10')
         for label, row in ((label_before, before), (control + ' at 9', lower_speed), ('revised', after)):
             if row is None:
                 continue

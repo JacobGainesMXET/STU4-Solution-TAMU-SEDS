@@ -117,6 +117,20 @@ class ForwardAvoidanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scene.assess([.12, 0., 0.], 16.01)
 
+    def test_final_new_closing_track_remains_visible_beyond_eight_seconds(self):
+        rock = track([100., 0., 0.], [-8., 0., 0.], hits=1)
+        early = PredictionScene([rock], 0., self.zero, self.zero, self.zero, self.model)
+        terminal = PredictionScene([rock], 0., self.zero, self.zero, self.zero, self.model, terminal=True)
+        self.assertGreater(early.assess(self.zero).clearance, 0.)
+        self.assertLess(terminal.assess(self.zero).hull_gap, 0.)
+
+    def test_oblique_escape_clears_head_on_without_reversing(self):
+        from offline_scenarios import run
+        result = run(obstacle=([500., 0., 0.], [-1., 0., 0.]), seed=23, score_cruise=True)
+        self.assertTrue(result['arrived'])
+        self.assertFalse(result['collision'])
+        self.assertGreater(result['avoidance_strategies'].get('VECTOR_ESCAPE', 0), 0)
+
     def test_safe_coast_precedes_a_safe_boost_when_nominal_burn_would_hit(self):
         class Crossing:
             def assess(_, acceleration, burn_seconds=8., initial_direction=None):
@@ -126,6 +140,32 @@ class ForwardAvoidanceTests(unittest.TestCase):
                                                      self.goal, 42., nose=self.goal)
         self.assertEqual(choice.strategy, 'COAST')
         np.testing.assert_array_equal(choice.acceleration, self.zero)
+
+    def test_short_transit_burn_expires_until_a_new_threat_observation(self):
+        class Crossing:
+            departure = False
+            age = 0.
+            coast_gap = 30.
+
+            def assess(scene, acceleration, burn_seconds=8., initial_direction=None):
+                gap = scene.coast_gap if not np.any(acceleration) else (5. if burn_seconds <= 2. else -1.)
+                return Encounter(clearance=gap, age=scene.age)
+
+        scene, planner = Crossing(), AvoidancePlanner(self.model)
+        def select(now):
+            return planner.choose(scene, .12*self.goal, 8.*self.goal, self.goal, now,
+                                  nose=self.goal, transit_burn=True)
+        for now, age, strategy in [(42., 0., 'SHORT_FORWARD'), (43., 1., 'SHORT_FORWARD'),
+                                   (44., 2., 'COAST'), (45., 0., 'SHORT_FORWARD')]:
+            scene.age = age
+            choice = select(now)
+            self.assertEqual(choice.strategy, strategy)
+            if now == 43.:
+                self.assertEqual(choice.burn_seconds, 1.)
+        scene.coast_gap = 4.
+        self.assertEqual(select(45.1).strategy, 'COAST')
+        scene.coast_gap, scene.departure = 30., True
+        self.assertEqual(select(45.2).strategy, 'COAST')
 
     def test_no_reverse_even_when_it_would_be_the_only_clear_action(self):
         class Blocked:
@@ -144,7 +184,7 @@ class ForwardAvoidanceTests(unittest.TestCase):
             self.assertLess(plan.encounter.clearance, 0.)
             self.assertGreaterEqual(plan.acceleration @ self.goal, 0.)
             if now < 20.:
-                self.assertEqual(plan.strategy, 'LAUNCH')
+                self.assertEqual(plan.strategy, 'LAUNCH_STRAIGHT_LIMITED_CLEARANCE')
                 np.testing.assert_array_equal(plan.acceleration, .09 * self.goal)
             else:
                 self.assertIn(plan.strategy, ('COAST_LIMITED_CLEARANCE', 'FORWARD_LIMITED_CLEARANCE'))
@@ -159,6 +199,53 @@ class ForwardAvoidanceTests(unittest.TestCase):
         blocked = self.scene([30., 0., 0.], [-4., 0., 0.])
         self.assertEqual(planner.choose(blocked, .09*self.goal, self.goal, self.goal, 20.,
                                         plan_on_coast=True).mode, 'AVOID')
+
+    def test_launch_offset_clears_a_crossing_without_waiting_for_nose_alignment(self):
+        scene = self.scene([30., 7., 0.], [-1., 0., 0.])
+        plan = AvoidancePlanner(self.model).choose(scene, .12*self.goal, 2.*self.goal,
+                                                  self.goal, 6., nose=-self.goal, launch=True)
+        self.assertLess(plan.baseline.clearance, 0.)
+        self.assertGreaterEqual(plan.encounter.clearance, 0.)
+        self.assertTrue(plan.launch_vector)
+        self.assertEqual(plan.strategy, 'LAUNCH_TILT')
+        self.assertGreaterEqual(plan.acceleration[0], .12*math.cos(math.radians(20.)) - 1e-10)
+        self.assertLess(plan.acceleration[1], 0.)
+
+    def test_launch_can_wait_on_pad_if_only_coast_is_clear(self):
+        class BlockedLift:
+            def assess(_, acceleration, burn_seconds=8., initial_direction=None):
+                return Encounter(clearance=-2. if np.any(acceleration) else 2.)
+        plan = AvoidancePlanner(self.model).choose(BlockedLift(), .12*self.goal, self.zero,
+                                                  self.goal, 1., launch=True)
+        self.assertEqual(plan.strategy, 'LAUNCH_COAST')
+        np.testing.assert_array_equal(plan.acceleration, self.zero)
+
+    def test_launch_timing_checks_the_allocator_acceleration_range(self):
+        rock = track([27., 32., 0.], [0., -1.6, 0.])
+        def gap(departure):
+            scene = PredictionScene([rock], 0., self.zero, self.zero, self.zero, self.model,
+                                    departure=departure, horizon=30.)
+            return scene.assess(.12*self.goal, 8.).clearance
+        self.assertGreater(gap(False), 0.)
+        self.assertLess(gap(True), 0.)
+
+    def test_closed_loop_directly_blocked_departure(self):
+        from offline_scenarios import run
+        result = run(obstacle=([65., 0., 0.], [-.55, 0., 0.]), seed=7)
+        self.assertTrue(result['arrived'])
+        self.assertFalse(result['collision'])
+        self.assertGreater(result['min_true_gap'], 0.)
+        self.assertTrue(any(name.startswith('LAUNCH_TILT') for name in result['avoidance_strategies']))
+
+    def test_extend_launch_prediction_only_for_well_observed_tracks(self):
+        rock = track([80., 0., 0.], [-2., 0., 0.], hits=7)
+        def coast():
+            return PredictionScene([rock], 0., self.zero, self.zero, self.zero, self.model,
+                                   departure=True).assess(self.zero)
+        self.assertAlmostEqual(coast().closest_time, 40.)
+        self.assertLess(coast().hull_gap, 0.)
+        rock.reliable_hits = 1
+        self.assertGreater(coast().clearance, 0.)
 
     def test_course_correction_preserves_speed_and_target_progress(self):
         v = np.array([5., 2., 1.])

@@ -16,7 +16,8 @@ import numpy as np
 import numpy.typing as npt
 
 from FlightRecorder import FlightRecorder
-from Guidance import AvoidancePlanner, AvoidanceDecision, Encounter, AccelerationGuidance, GuidanceDecision
+from Guidance import (AvoidancePlanner, AvoidanceDecision, Encounter, AccelerationGuidance,
+                      GuidanceDecision, PredictionScene)
 from RoutePlanner import Maneuver, RoutePlanner
 
 
@@ -25,8 +26,10 @@ class StopLoop(Exception):
 
 
 class FakeSimulation:
-    def __init__(self, failure=None, arrived=False, distance=1300., velocity=None, rotation=None, radar_period=4., no_debris_test=False, spin=None):
+    def __init__(self, failure=None, arrived=False, distance=1300., velocity=None, rotation=None,
+                 radar_period=4., no_debris_test=False, spin=None, stop_at=14.):
         self.now = 0.
+        self.stop_at = stop_at
         self.position = np.array([0., 0., -10000.])
         self.velocity = np.zeros(3) if velocity is None else np.array(velocity, dtype=float)
         self.distance = distance
@@ -44,7 +47,7 @@ class FakeSimulation:
         self.zero_time = datetime.datetime(2026, 1, 1)
 
     def sleep(self, dt):
-        if self.now > 14.:
+        if self.now > self.stop_at:
             raise StopLoop()
         thrust = self.rotation @ (self.command / np.linalg.norm(self.command) * .14) if np.linalg.norm(self.command) else np.zeros(3)
         self.position += self.velocity * dt + .5 * thrust * dt**2
@@ -140,6 +143,23 @@ class FakeSimulation:
 
 
 class ControllerLoopTests(unittest.TestCase):
+    def test_confirmed_vector_escape_is_allocated_in_world_direction(self):
+        sim = FakeSimulation(velocity=[5., 0., 0.], radar_period=.5, stop_at=51.)
+        sim.now = 50.
+        demand = np.array([.07, .05, 0.])
+        escape = AvoidanceDecision(demand, 'AVOID', Encounter(clearance=3.), Encounter(hull_gap=-2.),
+                                   forward_burn=True, burn_seconds=2., vector_escape=True)
+        sim.run(avoidance_decision=escape)
+        self.assertTrue(any(np.allclose(linear, demand) for _, linear, _ in sim.commands))
+
+    def test_lift_allocation_changes_only_after_liftoff_on_a_clear_corridor(self):
+        for gap, expected in [(3., .5), (20., .12)]:
+            simulation = FakeSimulation(velocity=[1., 0., 0.], no_debris_test=True, stop_at=1.)
+            clear = Encounter(clearance=gap)
+            plan = AvoidanceDecision(np.array([.12, 0., 0.]), 'GUIDANCE', clear, clear)
+            simulation.run(avoidance_decision=plan)
+            self.assertAlmostEqual(np.linalg.norm(simulation.commands[-1][1]), expected)
+
     def test_failed_strategic_forecast_keeps_immediate_collision_checks_running(self):
         simulation = FakeSimulation(radar_period=.5)
         with patch.object(RoutePlanner, 'command', side_effect=ArithmeticError('synthetic route fault')):
@@ -177,14 +197,17 @@ class ControllerLoopTests(unittest.TestCase):
         self.assertLess(max(firing_times), .15)  # next guidance plan is not until .30 s
         self.assertEqual(simulation.commands[1][1][0], 0.)
 
-    def test_emergency_avoidance_cancels_a_scheduled_course_burn(self):
-        hazard = AvoidanceDecision(np.array([0., 0., .05]), 'EMERGENCY',
-                                   Encounter(clearance=1., time=5.), Encounter(clearance=-5., time=5.), True)
+    def test_forward_avoidance_cancels_a_scheduled_course_burn(self):
+        hazard = AvoidanceDecision(np.array([.09, 0., 0.]), 'AVOID',
+                                   Encounter(clearance=1., time=5.), Encounter(clearance=-5., time=5.),
+                                   forward_burn=True, burn_seconds=2., strategy='FORWARD')
         simulation = FakeSimulation(velocity=[10., 1., 0.], no_debris_test=True)
         result = simulation.run(avoidance_decision=hazard)
-        self.assertEqual(result['mode'], 'EMERGENCY')
+        self.assertEqual(result['mode'], 'AVOID')
         self.assertIsNone(result['guidance'].burn)
-        self.assertTrue(all(linear[2] >= np.linalg.norm(linear[:2]) for _, linear, _ in simulation.commands))
+        self.assertTrue(any(linear[0] > 0. for _, linear, _ in simulation.commands))
+        self.assertTrue(all(linear[0] >= 0. and np.linalg.norm(linear[1:]) < 1e-12
+                            for _, linear, _ in simulation.commands))
 
     def test_forward_avoidance_steers_nose_and_commands_no_sideways_translation(self):
         angle = np.deg2rad(12.)
@@ -224,8 +247,10 @@ class ControllerLoopTests(unittest.TestCase):
         rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
         simulation = FakeSimulation(distance=1000., velocity=[10., 0., 0.], rotation=rotation,
                                     no_debris_test=True)
+        simulation.now, simulation.stop_at = 130., 144.
         result = simulation.run()
-        self.assertEqual(result['model'].coast_speed, 10.)
+        self.assertTrue(result['model'].score_cruise)
+        self.assertIsNone(result['model'].coast_speed)
         self.assertEqual(result['mode'], 'CLEAR_COAST')
         self.assertTrue(result['quiet_coast'])
         self.assertTrue(all(np.linalg.norm(np.r_[linear, angular]) == 0.
@@ -239,17 +264,21 @@ class ControllerLoopTests(unittest.TestCase):
         self.assertGreater(simulation.position[0], 10.)
         self.assertTrue(any(np.linalg.norm(linear) > .49 for _, linear, _ in simulation.commands))
 
-    def test_ten_meter_course_miss_uses_timed_trims_instead_of_full_thrust(self):
+    def test_ten_meter_course_miss_turns_and_trims_with_rear_thrust(self):
         simulation = FakeSimulation(distance=1000., velocity=[10., 1., 0.], no_debris_test=True)
+        simulation.now, simulation.stop_at = 130., 144.
         result = simulation.run()
         self.assertIn(result['mode'], ('TRIM_BURN', 'TRIM_WAIT', 'CLEAR_COAST'))
-        self.assertFalse(result['full_thrust'])
-        self.assertLess(simulation.velocity[1], 1.)
+        # Fixed attitude in this fake API verifies wiring, independent of turn dynamics.
+        self.assertTrue(any(angular[2] < 0. for _, _, angular in simulation.commands))
+        self.assertTrue(all(linear[0] >= 0. and np.linalg.norm(linear[1:]) < 1e-12
+                            for _, linear, _ in simulation.commands))
         self.assertTrue(any(np.linalg.norm(linear) > 0. for _, linear, _ in simulation.commands))
         self.assertTrue(all(np.linalg.norm(linear) < .49 for _, linear, _ in simulation.commands))
 
     def test_no_debris_test_mode_still_allows_unpowered_arrival_path(self):
         simulation = FakeSimulation(distance=300., velocity=[10., 0., 0.], failure='radar', no_debris_test=True)
+        simulation.now, simulation.stop_at = 130., 144.
         result = simulation.run()
         self.assertTrue(result['quiet_coast'])
         self.assertEqual(result['mode'], 'CLEAR_COAST')
@@ -270,6 +299,7 @@ class ControllerLoopTests(unittest.TestCase):
     def test_safe_coast_turns_all_thrusters_off_even_with_a_misaligned_nose(self):
         rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
         simulation = FakeSimulation(distance=300., velocity=[10., 0., 0.], rotation=rotation, radar_period=.5)
+        simulation.now, simulation.stop_at = 130., 144.
         result = simulation.run()
         self.assertTrue(result['quiet_coast'])
         self.assertEqual(result['mode'], 'CLEAR_COAST')
@@ -284,8 +314,9 @@ class ControllerLoopTests(unittest.TestCase):
                             for _, linear, angular in simulation.commands))
 
     def test_threat_overrides_an_otherwise_valid_coast(self):
-        hazard = AvoidanceDecision(np.array([0., .05, 0.]), 'EMERGENCY',
-                                   Encounter(clearance=1., time=5.), Encounter(clearance=-5., time=5.), True)
+        hazard = AvoidanceDecision(np.array([.09, .01, 0.]), 'AVOID',
+                                   Encounter(clearance=1., time=5.), Encounter(clearance=-5., time=5.),
+                                   forward_burn=True, burn_seconds=2., strategy='FORWARD')
         simulation = FakeSimulation(distance=300., velocity=[10., 0., 0.])
         result = simulation.run(avoidance_decision=hazard)
         self.assertFalse(result['quiet_coast'])
@@ -296,17 +327,20 @@ class ControllerLoopTests(unittest.TestCase):
         simulation.run()
         self.assertTrue(any('SENSOR_COAST' in message for message in simulation.messages))
 
-    def test_broadside_launch_builds_speed_with_tick_calibrated_translation_and_torque(self):
+    def test_broadside_launch_builds_speed_along_the_departure_line_with_bounded_turning(self):
         rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
         sim = FakeSimulation(rotation=rotation, no_debris_test=True)
         result = sim.run()
-        self.assertTrue(result['metered_launch'])
+        self.assertTrue(result['launch_burn'])
         self.assertTrue(any(np.linalg.norm(a) > 0. for _, _, a in sim.commands))
-        self.assertTrue(all(np.linalg.norm(a) <= .05 * result['ACTUATOR_PERIOD_S']
+        self.assertTrue(all(np.linalg.norm(a) <= .03 + 1e-12
                             for _, _, a in sim.commands))
         self.assertGreater(sim.velocity[0], 0.)
-        for _, linear, _ in sim.commands:
-            self.assertLess(np.linalg.norm(linear), .17 * result['ACTUATOR_PERIOD_S'])
+        lift = np.array([rotation @ linear for _, linear, _ in sim.commands])
+        np.testing.assert_allclose(lift[:, 1:], 0., atol=1e-12)
+        self.assertEqual(lift[0, 0], .5)
+        self.assertEqual(lift[-1, 0], .12)
+        self.assertTrue(np.all(np.isin(lift[:, 0], [.5, .12])))
 
     def test_nonurgent_avoidance_can_continue_coarse_alignment(self):
         rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
@@ -316,13 +350,37 @@ class ControllerLoopTests(unittest.TestCase):
         simulation.run(avoidance_decision=moderate)
         self.assertTrue(any(np.linalg.norm(angular) > 0. for _, _, angular in simulation.commands))
 
-    def test_urgent_avoidance_does_not_chase_target_alignment(self):
+    def test_launch_uses_a_clear_angled_vector_even_from_a_broadside_pad(self):
         rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
-        hazard = AvoidanceDecision(np.array([0., .05, 0.]), 'EMERGENCY',
-                                   Encounter(clearance=1.), Encounter(clearance=-5., time=3.), True)
-        simulation = FakeSimulation(rotation=rotation)
-        simulation.run(avoidance_decision=hazard)
-        self.assertTrue(all(np.linalg.norm(angular) == 0. for _, _, angular in simulation.commands))
+        simulation = FakeSimulation(radar_period=.5, rotation=rotation)
+        def assess(scene, accel, seconds=8., initial_direction=None):
+            return Encounter(clearance=2. if accel[1] > .015 else -5., time=3.)
+        with patch.object(PredictionScene, 'assess', assess):
+            result = simulation.run()
+        self.assertEqual(result['plan'].strategy, 'LAUNCH_TILT')
+        self.assertLess(result['plan'].baseline.clearance, 0.)
+        self.assertGreater(result['plan'].encounter.clearance, 0.)
+        powered = [rotation @ linear for t, linear, _ in simulation.commands if np.linalg.norm(linear)]
+        self.assertTrue(powered)
+        for world in powered:
+            self.assertGreater(world[1], 0.)
+            self.assertGreater(world[0], .46)
+            self.assertAlmostEqual(np.linalg.norm(world), .5)
+
+    def test_detected_hazard_can_still_command_an_escape_after_seventy_percent(self):
+        simulation = FakeSimulation(distance=500., velocity=[10., 1., 0.],
+                                    radar_period=.5, stop_at=37.)
+        hazard = AvoidanceDecision(np.array([.09, 0., 0.]), 'AVOID',
+                                   Encounter(clearance=1.), Encounter(clearance=-5., time=5.),
+                                   forward_burn=True, burn_seconds=2., strategy='FORWARD')
+        with patch.object(AvoidancePlanner, 'choose', return_value=hazard) as chooser:
+            result = simulation.run()
+        self.assertEqual(result['mode'], 'AVOID')
+        self.assertFalse(chooser.call_args.kwargs['coast_only'])
+        self.assertTrue(any(linear[0] > 0. for t, linear, _ in simulation.commands if 21. < t < 28.))
+        final_commands = [np.r_[linear, angular] for t, linear, angular in simulation.commands if t >= 36.]
+        self.assertTrue(final_commands)
+        self.assertTrue(any(linear[0] > 0. for linear in final_commands))
 
     def test_acquisition_then_guidance_sends_finite_bounded_commands(self):
         simulation = FakeSimulation()

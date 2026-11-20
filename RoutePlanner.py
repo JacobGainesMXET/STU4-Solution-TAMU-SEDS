@@ -121,7 +121,7 @@ def forecast(guidance, r, v, gravity, reference, now, fuel, action, nose=None):
                 heading = end_heading
             step = speed * dt + .5 * (accel + gravity) * dt**2
             cutoff_radius = (1. - COAST_PROGRESS) * guide.launch_distance
-            if not guide.distance_coast and np.linalg.norm(remaining - step) <= cutoff_radius:
+            if not model.score_cruise and not guide.distance_coast and np.linalg.norm(remaining - step) <= cutoff_radius:
                 crossing = ballistic_entry(remaining, speed, accel + gravity, cutoff_radius, dt)
                 if math.isfinite(crossing):
                     dt = crossing
@@ -227,26 +227,33 @@ class RadarField:
         # For a spherical obstacle the plane perpendicular to closest separation
         # bounds the whole segment. Project the track covariance onto that normal.
         # Check both time endpoints and retain the broad-axis confidence gate.
-        normal = closest / np.maximum(miss[:, :, None], 1e-8)
         bound = np.maximum(self.sigma[:, 1:n], self.sigma[:, :n-1])
-        def projected(lo, hi):
-            return (np.einsum('nti,ntij,ntj->nt', normal, self.cov[:, lo:hi], normal)
-                    + self.process_var[:, lo:hi])
-        sigma = np.sqrt(np.maximum(0., np.maximum(projected(0, n-1), projected(1, n))))
-        sigma = np.where(miss < 1e-8, bound, sigma)
-        clearance = miss - self.radius[:, None] - self.model.uncertainty_sigma * sigma
-        clearance -= .125 * max(self.model.planning_accel, self.model.avoidance_accel) * STEP**2
         # A very diffuse forecast cannot justify fuel expenditure on a specific
         # side of a rock. The tactical layer still sees these observations.
         diffuse = bound > np.maximum(25., self.radius[:, None])
         unresolved = frozenset(self.ids[np.any(diffuse & (miss <= self.radius[:, None] + 25.), axis=1)])
-        clearance[diffuse] = math.inf
-        threats = frozenset(self.ids[np.any(clearance < 0., axis=1)])
-        i, j = np.unravel_index(np.argmin(clearance), clearance.shape)
-        if not math.isfinite(clearance[i, j]):
+        upper = miss - self.radius[:, None] - .125 * max(self.model.planning_accel, self.model.avoidance_accel) * STEP**2
+        upper[diffuse] = math.inf
+        least_upper = np.min(upper)
+        if not math.isfinite(least_upper):
             return Risk(unresolved=unresolved, approaching_at_horizon=approaching)
+        # Project covariance only for segments that could be a threat or the
+        # global closest clearance. The broad-axis sigma bounds every projection.
+        lower = upper - self.model.uncertainty_sigma * bound
+        rows, cols = np.nonzero(lower <= max(0., least_upper))
+        distances = miss[rows, cols]
+        normal = closest[rows, cols] / np.maximum(distances[:, None], 1e-8)
+        def projected(times):
+            return (np.einsum('ni,nij,nj->n', normal, self.cov[rows, times], normal)
+                    + self.process_var[rows, times])
+        sigma = np.sqrt(np.maximum(0., np.maximum(projected(cols), projected(cols + 1))))
+        sigma = np.where(distances < 1e-8, bound[rows, cols], sigma)
+        clearance = upper[rows, cols] - self.model.uncertainty_sigma * sigma
+        threats = frozenset(self.ids[rows[clearance < 0.]])
+        index = int(np.argmin(clearance))
+        i, j = rows[index], cols[index]
         time = TIMES[j] + frac[i, j] * min(STEP, path.eta - TIMES[j])
-        return Risk(float(clearance[i,j]), float(miss[i,j]), float(time), float(sigma[i,j]),
+        return Risk(float(clearance[index]), float(miss[i,j]), float(time), float(sigma[index]),
                     int(self.ids[i]), len(threats), threats, unresolved, approaching)
 
     def improves_close_pass(self, candidate, direct):
@@ -284,7 +291,10 @@ class Search:
             clear = risk.clears(self.direct_risk)
             if not clear and not self.field.improves_close_pass(risk, self.direct_risk):
                 continue
-            rank = (clear, straight if clear else False, 0. if clear else risk.clearance, path.score)
+            if self.field.model.score_cruise:
+                rank = (clear, 0. if clear else risk.clearance, path.score, straight)
+            else:
+                rank = (clear, straight if clear else False, 0. if clear else risk.clearance, path.score)
             if rank > self.rank:
                 self.best, self.rank = action, rank
         return count
@@ -346,7 +356,8 @@ class RoutePlanner:
             direct, risk = evaluate(None)
             # Price the cruise speed once during early ascent. Use the slower
             # option only if it has a clear observed corridor and a score margin.
-            if (not self.cruise_reviewed and now >= 4. and nominal.mode == 'ACCELERATE'
+            if (not guidance.model.score_cruise and guidance.model.arrival_target is None and not self.cruise_reviewed
+                    and now >= 4. and nominal.mode == 'ACCELERATE'
                     and guidance.model.coast_speed == 10. and v @ goal < 4.):
                 self.cruise_reviewed = True
                 economy = copy.deepcopy(guidance)

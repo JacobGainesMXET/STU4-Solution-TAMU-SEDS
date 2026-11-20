@@ -23,6 +23,8 @@ def unit(vector, fallback=(1., 0., 0.)):
 LAUNCH_PLAN_TIME = 20.
 COAST_PROGRESS = .70
 FORWARD_LOOKAHEAD = 16.
+LAUNCH_LIFT_MIN = .08  # m/s², bracketed from broadside jet-allocation checks
+LAUNCH_LIFT_MAX = .16
 
 
 def rear_thrust(request, nose, goal, velocity):
@@ -69,6 +71,8 @@ class MissionModel:
     radar_timeout: float = 3.
     avoidance_turn_rate: float = math.radians(.25)  # conservative allocated-attitude forecast
     avoidance_turn_delay: float = 3.              # allow time for damped attitude response
+    arrival_target: float | None = None  # absolute mission seconds, optional time-directed cruise
+    score_cruise: bool = False
 
     def score(self, elapsed, fuel, damage=0.):
         time_score = self.nominal_time / elapsed if elapsed > 0. else 0.
@@ -105,8 +109,14 @@ class StateHistory:
             self.samples.popleft()
 
     def at(self, time):
-        if not self.samples or time < self.samples[0][0] - .5 or time > self.samples[-1][0] + .2:
+        if not self.samples or time > self.samples[-1][0] + .2:
             return None
+        first_time, _, first_velocity = self.samples[0]
+        if time < first_time - .5:
+            # The initial radar sweep is stamped zero. The control loop can
+            # start a fraction of a second later while the shuttle is on its pad.
+            if not (0. <= time < first_time <= 1. and np.linalg.norm(first_velocity) <= .1):
+                return None
         times = [sample[0] for sample in self.samples]
         index = int(np.searchsorted(times, time))
         if index == 0 or index == len(times):
@@ -401,17 +411,25 @@ class AccelerationGuidance:
         self.reburn_advantage = 0.
         self.launch_distance = None
         self.distance_coast = False
+        self.transit_reason = 'speed cutoff'
+        self.coast_arrival = math.inf
 
     def observe_distance(self, distance):
         if self.launch_distance is None:
             self.launch_distance = distance
-        self.distance_coast |= distance <= (1. - COAST_PROGRESS) * self.launch_distance
+        if not self.model.score_cruise:
+            self.distance_coast |= distance <= (1. - COAST_PROGRESS) * self.launch_distance
 
     def finish_burn(self, now):
         if self.burn is not None:
             self.last_burn_end = now
             self.coast_started = now
         self.burn = None
+
+    def departure_horizon(self, distance, closing_speed):
+        # Carry the extended forecast only as far as the remaining launch area.
+        remaining = distance - .90 * self.launch_distance
+        return float(np.clip(remaining / max(.1, closing_speed), self.model.horizon, 1.5 * self.model.horizon))
 
     def remaining_burn(self, now, velocity, gravity):
         return self.burn.remaining(now, velocity, gravity) if self.burn is not None else 0.
@@ -506,39 +524,113 @@ class AccelerationGuidance:
         self._start_burn(acceleration, duration, 'TRIM_BURN', now, v, g)
         return self._burn_decision(r, v, g, now, entry if math.isfinite(entry) else eta)
 
+    def _transit_cutoff(self, r, v, g, now, fuel, entry, radius):
+        """Stop the main burn as soon as coasting can meet the arrival window."""
+        model = self.model
+        direction = unit(r)
+        closing, gravity = float(v @ direction), float(g @ direction)
+        distance = max(0., float(np.linalg.norm(r)) - radius)
+        radial_eta = travel_time(distance, closing, gravity)
+        # A lateral miss still needs a course trim. Use radial timing to decide
+        # whether more forward speed is worth buying independently of that trim.
+        self.coast_arrival = now + entry
+        eta = entry if math.isfinite(entry) else radial_eta
+        if closing <= 0. or not math.isfinite(eta):
+            self.transit_reason = 'acquire closing speed'
+            return False
+        if now + eta <= model.arrival_target + (2. if self.coast_latched else 0.):
+            self.transit_reason = 'on schedule'
+            return True
+        # Reserve one m/s of corrective impulse plus one telemetry interval
+        # of propellant. The measured price includes allocated translation jets.
+        if fuel + model.fuel_per_dv + 1. >= model.nominal_fuel:
+            self.transit_reason = 'maneuver reserve'
+            return True
+        # If even full forward thrust cannot meet the deadline, stop when one
+        # extra kg buys less than one second. For a ballistic radial intercept
+        # d = v*t + g*t^2/2 gives -dt/dv = t/(v + g*t).
+        earliest = travel_time(distance, closing, gravity + model.planning_accel)
+        entry_speed = closing + gravity * radial_eta
+        if (now + earliest > model.arrival_target and math.isfinite(radial_eta)
+                and entry_speed > 0. and radial_eta < entry_speed * model.fuel_per_dv):
+            self.transit_reason = 'low time saving'
+            return True
+        self.transit_reason = 'build closing speed'
+        return False
+
+    def _score_cutoff(self, r, v, g, now, fuel, entry, radius):
+        """Price the next two seconds of forward impulse through target entry."""
+        model = self.model
+        axis = unit(r)
+        self.coast_arrival = now + entry
+        # If an unpowered flyby misses laterally, price forward motion on the
+        # radial projection. The 3-D capture test still requires a course trim.
+        if not math.isfinite(entry):
+            r = np.linalg.norm(r) * axis
+            v = (v @ axis) * axis
+            g = (g @ axis) * axis
+            entry = travel_time(np.linalg.norm(r) - radius, v @ axis, g @ axis)
+        if not math.isfinite(entry) or entry > 600. or v @ axis <= 0.:
+            self.transit_reason = 'acquire closing speed'
+            return False
+        if fuel + model.fuel_per_dv + 1. >= model.nominal_fuel:
+            self.transit_reason = 'maneuver reserve'
+            return True
+        duration = min(2., entry)
+        accel = model.planning_accel * axis
+        powered = finite_burn_entry(r, v, g, accel, duration, radius)
+        extra_fuel = model.fuel_per_dv * model.planning_accel * min(duration, powered)
+        self.reburn_advantage = (model.score(now + powered, fuel + extra_fuel)
+                                 - model.score(now + entry, fuel)) if math.isfinite(powered) else -math.inf
+        coast = self.reburn_advantage <= (.05 if self.coast_latched else 0.)
+        self.transit_reason = 'score favors coast' if coast else 'score favors burn'
+        return coast
+
     def decide(self, relative_position, relative_velocity, gravity, elapsed, fuel, reference, *, nose=None):
         model = self.model
-        cruise = model.cruise_burns and model.coast_speed is not None
+        timed_transit = model.cruise_burns and model.arrival_target is not None
+        adaptive = timed_transit or model.score_cruise
+        cruise = adaptive or (model.cruise_burns and model.coast_speed is not None)
         distance_now = np.linalg.norm(relative_position)
         self.observe_distance(distance_now)
         if distance_now <= model.success_radius:
             self.finish_burn(elapsed)
+            self.coast_arrival, self.transit_reason = elapsed, 'arrived'
             return GuidanceDecision(np.zeros(3), 'ARRIVED', 0.)
         if self.distance_coast:
             self.finish_burn(elapsed)
             entry = ballistic_entry(relative_position, relative_velocity, gravity, model.success_radius, 600.)
+            self.coast_arrival, self.transit_reason = elapsed + entry, 'distance cutoff'
             return GuidanceDecision(np.zeros(3), 'DISTANCE_COAST', entry, coast_entry=entry)
         approaching = float(relative_position @ relative_velocity) > 0.
         # Remember reaching the cutoff so gravity slowing a safe coast below it
         # does not repeatedly restart the main burn. A changed trajectory still
         # has to pass the arrival test below, or receive a course correction.
-        if not approaching or model.coast_speed is None:
-            self.coast_latched = False
-        elif (float(relative_velocity @ unit(relative_position)) if cruise
-              else np.linalg.norm(relative_velocity)) >= model.coast_speed - (.05 if cruise else 0.):
-            self.coast_latched = True
+        if not adaptive:
+            if not approaching or model.coast_speed is None:
+                self.coast_latched = False
+            else:
+                speed = float(relative_velocity @ unit(relative_position)) if cruise else np.linalg.norm(relative_velocity)
+                if speed >= model.coast_speed - (.05 if cruise else 0.):
+                    self.coast_latched = True
         # Enter with 8 m radial margin; retain coast with 4 m margin and a larger
         # prediction window to avoid thrust chatter at the edge of the capture test.
         # At the speed cutoff, allow a long coast: the old 90 s limit alone could
         # otherwise force continued acceleration even on an aligned 8 m/s path.
         capture_radius = model.success_radius - (4. if self.ballistic_coasting else 8.)
-        horizon = 600. if self.coast_latched else (120. if self.ballistic_coasting else 90.)
+        horizon = 600. if adaptive or self.coast_latched else (120. if self.ballistic_coasting else 90.)
         coast_entry = ballistic_entry(relative_position, relative_velocity, gravity,
                                        capture_radius, horizon)
+        if model.score_cruise:
+            self.coast_latched = self._score_cutoff(relative_position, relative_velocity, gravity,
+                                                    elapsed, fuel, coast_entry, capture_radius)
+        elif timed_transit:
+            self.coast_latched = self._transit_cutoff(relative_position, relative_velocity, gravity,
+                                                     elapsed, fuel, coast_entry, capture_radius)
         self.ballistic_coasting = (math.isfinite(coast_entry) and approaching
                                   and (not cruise or self.coast_latched or coast_entry <= 8.))
         if self.ballistic_coasting:
-            if cruise and coast_entry > 8.:
+            if cruise and not adaptive and coast_entry > 8.:
                 decision = self._speed_burn(relative_position, relative_velocity, gravity,
                                              elapsed, fuel, coast_entry, capture_radius, nose)
                 if decision is not None:
@@ -589,7 +681,7 @@ class AccelerationGuidance:
             self.coast_started = None
         if self.coast_latched or np.linalg.norm(lateral_miss) > aim_radius:
             settle = .25 * correction_eta
-            if cruise:
+            if cruise and not model.score_cruise:
                 to_cutoff = max(0., distance_now - (1. - COAST_PROGRESS) * self.launch_distance)
                 remaining_burn_time = travel_time(to_cutoff, speed, model.planning_accel + g_along)
                 settle = min(settle, .6 * remaining_burn_time)
@@ -651,6 +743,7 @@ class Encounter:
     age: float = 0.
     closest_time: float = math.inf
     physical_time: float = math.inf
+    hull_gap: float = math.inf       # smallest modeled hull-to-hull gap across all tracks
 
 
 def burn_displacement(times, acceleration, burn_seconds=8., initial_direction=None,
@@ -689,10 +782,14 @@ class PredictionScene:
     Half-second sampling gets a relative-speed margin to cover between-sample misses.
     Unconfirmed tracks use an 8 s horizon while their transverse velocity is unknown.
     """
-    def __init__(self, tracks, now, ship_position, ship_velocity, gravity, model, horizon=None):
+    def __init__(self, tracks, now, ship_position, ship_velocity, gravity, model, horizon=None,
+                 departure=False, terminal=False):
         self.model = model
         self.tracks = list(tracks)
-        self.times = np.arange(0., min(model.horizon, horizon or model.horizon) + .25, .5)
+        self.departure = departure
+        self.launch_lift = departure and now < LAUNCH_PLAN_TIME
+        lookahead = 1.5 * model.horizon if departure else model.horizon
+        self.times = np.arange(0., min(lookahead, horizon if horizon is not None else lookahead) + .25, .5)
         states, covariances = [], []
         for track in self.tracks:
             state, covariance = track.predict(now, gravity, model)
@@ -706,8 +803,17 @@ class PredictionScene:
         self.velocity = states[:, 3:] - ship_velocity
         self.radii = np.array([track.radius * 1.15 + model.ship_radius + model.clearance for track in self.tracks])
         self.valid = self.times[None, :] <= np.array([
-            min(model.horizon, 8. + 8. * (track.hits - 1)) for track in self.tracks])[:, None]
+            min(lookahead, 8. + 8. * (track.hits - 1)) for track in self.tracks])[:, None]
         self.ages = np.array([now - track.time for track in self.tracks])
+        if terminal:
+            # Eight seconds on a new track can leave less than one radar
+            # revisit plus the time needed to clear a shuttle radius. Look
+            # through the second-hit horizon for closing contacts. Keep that
+            # horizon until track expiry; uncertainty grows with sample age.
+            closing = np.sum(self.position * self.velocity, axis=1) < 0.
+            first = np.array([track.hits == 1 for track in self.tracks])
+            extend = first & closing
+            self.valid |= extend[:, None] & (self.times <= 16.)
         t = self.times[None, :, None, None]
         self.future_covariance = (self.covariances[:, None, :3, :3]
                                   + t * (self.covariances[:, None, :3, 3:] + self.covariances[:, None, 3:, :3])
@@ -718,9 +824,19 @@ class PredictionScene:
         time = self.times[None, :]
         powered = np.minimum(time, FORWARD_LOOKAHEAD)
         maximum_accel = max(model.planning_accel, model.avoidance_accel)
+        if model.score_cruise:
+            maximum_accel = max(maximum_accel, .25)
+        if self.launch_lift:
+            maximum_accel = max(maximum_accel, LAUNCH_LIFT_MAX)
         maximum_displacement = maximum_accel * (.5 * powered**2 + powered * (time - powered))
         maximum_variance = np.max(np.sum(np.abs(self.future_covariance), axis=3), axis=2)
         maximum_variance += .25 * model.process_accel_sigma**2 * time**4
+        if departure:
+            # Extend only well-observed tracks. A distant, diffuse forecast must
+            # not obscure an actionable near-field encounter.
+            reliable = np.array([track.reliable_hits >= 3 for track in self.tracks])[:, None]
+            self.valid &= ((time <= model.horizon) |
+                           (reliable & (maximum_variance <= np.maximum(15., self.radii[:, None])**2)))
         maximum_margin = model.uncertainty_sigma * np.sqrt(np.maximum(maximum_variance, 0.))
         maximum_margin += .25 * (np.linalg.norm(self.velocity, axis=1)[:, None] + maximum_accel * powered)
         unforced_distance = np.linalg.norm(self.position[:, None, :] + self.velocity[:, None, :] * time[:, :, None], axis=2)
@@ -729,7 +845,7 @@ class PredictionScene:
         for name in ('position', 'velocity', 'radii', 'valid', 'ages', 'future_covariance'):
             setattr(self, name, getattr(self, name)[relevant])
 
-    def assess(self, acceleration, burn_seconds=8., initial_direction=None):
+    def assess(self, acceleration, burn_seconds=8., initial_direction=None, *, vector_escape=False):
         if not len(self.position):
             return Encounter()
         if not 0. <= burn_seconds <= FORWARD_LOOKAHEAD:
@@ -738,6 +854,20 @@ class PredictionScene:
         powered = np.minimum(time, burn_seconds)
         delayed, instant = burn_displacement(time, acceleration, burn_seconds, initial_direction,
                                              self.model.avoidance_turn_rate, self.model.avoidance_turn_delay)
+        magnitude = np.linalg.norm(acceleration)
+        speed_bound = magnitude
+        if self.launch_lift and initial_direction is None and magnitude > 1e-9:
+            # The allocator preserves the lift direction, but attitude and torque
+            # change the delivered magnitude. Test the segment between both limits.
+            delayed = instant * min(1., LAUNCH_LIFT_MIN / magnitude)
+            speed_bound = max(magnitude, LAUNCH_LIFT_MAX)
+            instant = instant * (speed_bound / magnitude)
+        elif vector_escape and magnitude > 1e-9:
+            # Body jets can deliver an oblique world command without waiting
+            # for the nose. Bracket the allocated impulse in the forecast.
+            delayed = instant * (min(.05, magnitude) / magnitude)
+            speed_bound = max(.25, magnitude)
+            instant = instant * (speed_bound / magnitude)
         separation = self.position[:, None, :] + self.velocity[:, None, :] * time[None, :, None]
         separation -= delayed[None, :, :]
         # Check the swept corridor between an immediate turn and the delayed turn.
@@ -754,17 +884,18 @@ class PredictionScene:
         uncertainty = self.model.uncertainty_sigma * np.sqrt(np.maximum(variance, 0.))
         # Cover the distance to the nearest sample even at the largest segment speed.
         sample_margin = .25 * (np.linalg.norm(self.velocity, axis=1)[:, None]
-                               + np.linalg.norm(acceleration) * powered[None, :])
+                               + speed_bound * powered[None, :])
         clearance = distance - self.radii[:, None] - uncertainty - sample_margin
         clearance[~self.valid] = math.inf
         row, column = np.unravel_index(np.argmin(clearance), clearance.shape)
         dangerous = clearance < 0.
         first_time = float(time[np.flatnonzero(np.any(dangerous, axis=0))[0]]) if np.any(dangerous) else math.inf
-        hull_contact = self.valid & (distance <= self.radii[:, None] - self.model.clearance + sample_margin)
-        impacts = np.flatnonzero(np.any(hull_contact, axis=0))
+        hull_gap = distance - self.radii[:, None] + self.model.clearance - sample_margin
+        hull_gap[~self.valid] = math.inf
+        impacts = np.flatnonzero(np.any(hull_gap <= 0., axis=0))
         return Encounter(float(clearance[row, column]), first_time, self.tracks[row].number,
                          float(distance[row, column]), float(uncertainty[row, column]), float(self.ages[row]), float(time[column]),
-                         float(time[impacts[0]]) if len(impacts) else math.inf)
+                         float(time[impacts[0]]) if len(impacts) else math.inf, float(np.min(hull_gap)))
 
 
 @dataclass
@@ -778,6 +909,8 @@ class AvoidanceDecision:
     forward_burn: bool = False
     burn_seconds: float = 8.
     strategy: str = 'GUIDANCE'
+    launch_vector: bool = False
+    vector_escape: bool = False
 
 
 class AvoidancePlanner:
@@ -788,9 +921,63 @@ class AvoidancePlanner:
         self.safe_since = None
         self.forward_burn = False
         self.burn_until = -math.inf
+        self.short_burn_end = -math.inf
+
+    def _launch(self, scene, nominal, velocity, axis, duration, direct, allow_forward):
+        # The existing launch allocator can lift along a world-frame vector
+        # even while the vehicle is broadside. Use that same burn for a small
+        # deflection. Compare the coast on the same moving-debris timeline.
+        coast = scene.assess(np.zeros(3))
+        options = [(np.zeros(3), 0., coast)]
+        if allow_forward:
+            options.append((nominal, duration, direct))
+            side = unit(np.cross(axis, np.eye(3)[np.argmin(np.abs(axis))]))
+            other = np.cross(axis, side)
+            for degrees in (6., 12., 20.):
+                tangent = math.tan(math.radians(degrees))
+                for azimuth in np.arange(8) * math.pi / 4.:
+                    tilt = math.cos(azimuth) * side + math.sin(azimuth) * other
+                    accel = np.linalg.norm(nominal) * unit(axis + tangent * tilt)
+                    if velocity @ axis > 0. and accel @ velocity < 0.:
+                        continue
+                    options.append((accel, duration, scene.assess(accel, duration)))
+
+        safe = [item for item in options if item[2].clearance >= 0.]
+        if safe:
+            # Prefer the shallowest clear departure to sitting on a blocked pad.
+            pool = safe
+        else:
+            # First protect the closest physical pass, even if another track
+            # dominates the statistical envelope. A sub-metre change is below
+            # the radar position noise. Keep the existing heading on near ties.
+            gap = max(min(hit.hull_gap, self.model.clearance) for _, _, hit in options)
+            minimum_gap = max(0., gap - .25) if gap >= 0. else gap - .25
+            pool = [item for item in options if item[2].hull_gap >= minimum_gap]
+            margin = max(item[2].clearance for item in pool)
+            pool = [item for item in pool if item[2].clearance >= margin - .5]
+        def preference(item):
+            accel, seconds, hit = item
+            previous_axis = unit(self.previous, axis) if self.active else axis
+            aim = unit(accel)
+            # While the margin is unresolved, keep the selected side on near
+            # ties. A shorter remaining launch burn alone need not undo the turn.
+            alignment = round(float(aim @ axis), 6)
+            continuity = round(float(aim @ previous_axis), 6) if self.active else alignment
+            return (seconds > 0., alignment if safe else continuity,
+                    continuity if safe else alignment, hit.clearance)
+        accel, seconds, hit = max(pool, key=preference)
+        self.active, self.forward_burn = True, False  # rear-only burns are rechecked at handoff
+        self.previous = accel.copy()
+        strategy = 'LAUNCH_COAST' if not seconds else ('LAUNCH_STRAIGHT' if np.array_equal(accel, nominal)
+                                                       else 'LAUNCH_TILT')
+        if hit.clearance < 0.:
+            strategy += '_LIMITED_CLEARANCE'
+        return AvoidanceDecision(accel, 'AVOID', hit, direct, hit.time < 6., len(options),
+                                 bool(seconds), seconds, strategy, bool(seconds))
 
     def choose(self, scene, nominal, velocity, goal, now, *, nose=None, allow_forward=True,
-               nominal_burn_seconds=8., rear_guidance=False, launch=False, coast_only=False, plan_on_coast=False):
+               nominal_burn_seconds=8., rear_guidance=False, launch=False, coast_only=False, plan_on_coast=False,
+               transit_burn=False):
         nominal = nonbraking(nominal, velocity, goal)
         if coast_only:
             nominal = np.zeros(3)
@@ -799,8 +986,10 @@ class AvoidancePlanner:
         baseline = (scene.assess(nominal, nominal_burn_seconds, initial_direction=nose)
                     if rear_guidance else scene.assess(nominal, nominal_burn_seconds))
         goal_axis = unit(goal)
+        if launch and not coast_only and baseline.clearance < 0. and np.linalg.norm(nominal) > 0.:
+            return self._launch(scene, nominal, velocity, goal_axis, nominal_burn_seconds,
+                                baseline, allow_forward)
         if launch or coast_only:
-            # Continue to measure the risk even when the flight phase fixes the command.
             self.active = self.forward_burn = False
             return AvoidanceDecision(nominal, 'GUIDANCE', baseline, baseline,
                                      strategy='DISTANCE_COAST' if coast_only else 'LAUNCH')
@@ -825,6 +1014,25 @@ class AvoidancePlanner:
             self.safe_since = None
         coast = scene.assess(np.zeros(3))
         if coast.clearance >= 0. and velocity @ goal_axis > .5:
+            # A blocked eight-second burn can still leave room for a brief,
+            # straight impulse. Protect the coast corridor over the entire
+            # prediction horizon, including a high delivered thrust estimate.
+            if (transit_burn and allow_forward and not scene.departure and nose is not None
+                    and nose @ unit(nominal) >= math.cos(math.radians(5.))
+                    and nose @ goal_axis > 0. and nose @ velocity > 0.):
+                remaining = self.short_burn_end - now
+                if remaining <= 0. and now - baseline.age > self.short_burn_end:
+                    remaining = 2.
+                swept = .25 * remaining * self.model.horizon
+                if (remaining > 0. and baseline.age <= self.model.radar_timeout
+                        and coast.clearance >= self.model.clearance + swept):
+                    accel = np.linalg.norm(nominal) * nose
+                    hit = scene.assess(accel, remaining, initial_direction=nose)
+                    if hit.clearance >= self.model.clearance:
+                        self.previous, self.forward_burn, self.active = accel, True, True
+                        self.burn_until = self.short_burn_end = now + remaining
+                        return AvoidanceDecision(accel.copy(), 'AVOID', hit, baseline, False, 3,
+                                                 True, remaining, 'SHORT_FORWARD')
             self.active, self.forward_burn = True, False
             self.previous = np.zeros(3)
             return AvoidanceDecision(self.previous.copy(), 'AVOID', coast, baseline,
@@ -861,7 +1069,11 @@ class AvoidancePlanner:
         count = 1
         # Keep the best executable path even if every uncertainty envelope overlaps.
         # Prefer avoiding predicted hull contact, then greater margin at closest pass.
-        fallback_rank = (coast.physical_time, coast.clearance)
+        def fallback_rank(hit):
+            if getattr(scene, 'departure', False):
+                return (min(hit.hull_gap, self.model.clearance), hit.clearance, hit.physical_time)
+            return (hit.physical_time, hit.clearance)
+        best_rank = fallback_rank(coast)
         fallback = (np.zeros(3), 0., coast)
         # A rear-thrust maneuver is meaningful only while the nose already faces
         # generally toward the target. Otherwise coast while aligning the nose.
@@ -873,9 +1085,9 @@ class AvoidancePlanner:
                     continue
                 for duration in (2., 4., 8., FORWARD_LOOKAHEAD):
                     encounter = scene.assess(acceleration, duration, initial_direction=nose)
-                    rank = (encounter.physical_time, encounter.clearance)
-                    if rank > fallback_rank:
-                        fallback_rank, fallback = rank, (acceleration, duration, encounter)
+                    rank = fallback_rank(encounter)
+                    if rank > best_rank:
+                        best_rank, fallback = rank, (acceleration, duration, encounter)
                     count += 1
                     if encounter.clearance < 0.:
                         continue
@@ -904,6 +1116,33 @@ class AvoidancePlanner:
                                      baseline.time < 6., count, strategy='COAST')
 
         acceleration, duration, encounter = fallback
+        if (self.model.score_cruise and allow_forward and now >= LAUNCH_PLAN_TIME
+                and coast.hull_gap < self.model.clearance and encounter.hull_gap < self.model.clearance):
+            # Test direct jet allocation only when coast and rear-only choices
+            # still threaten the hull. Rank the worst pass across all tracks.
+            best = None
+            for degrees in (25., 45.):
+                tangent = math.tan(math.radians(degrees))
+                for side in (course_side, -course_side, course_other, -course_other):
+                    axis = unit(course + tangent * side)
+                    if axis @ goal_axis <= 0. or axis @ velocity < 0.:
+                        continue
+                    accel = self.model.avoidance_accel * axis
+                    for seconds in (8., FORWARD_LOOKAHEAD):
+                        hit = scene.assess(accel, seconds, vector_escape=True)
+                        count += 1
+                        if hit.hull_gap < encounter.hull_gap + 1. or hit.age > self.model.radar_timeout:
+                            continue
+                        rank = (hit.clearance >= 0., min(hit.hull_gap, self.model.clearance),
+                                hit.clearance, float(axis @ unit(self.previous, goal_axis)), -seconds)
+                        if best is None or rank > best[0]:
+                            best = (rank, accel, seconds, hit)
+            if best is not None:
+                _, accel, seconds, hit = best
+                self.active, self.forward_burn = True, False
+                self.previous = accel.copy()
+                return AvoidanceDecision(accel, 'AVOID', hit, baseline, hit.time < 6., count,
+                                         True, seconds, 'VECTOR_ESCAPE', vector_escape=True)
         self.active, self.forward_burn = True, duration > 0.
         self.previous = acceleration.copy()
         self.burn_until = now + duration

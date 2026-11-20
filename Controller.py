@@ -277,7 +277,7 @@ from Guidance import (MissionModel, StateHistory, RadarTracker, AccelerationGuid
 from FlightRecorder import FlightRecorder
 from RoutePlanner import RoutePlanner
 
-# Main forward burns on clear paths and shallow avoidance; pulsed emergency escape.
+# Main forward burns on clear paths and radar-directed departure burns.
 ATTITUDE_GAIN = 0.15
 MAX_TURN_RAD_S = math.radians(3.0)
 MAX_ANG_ACCEL = 0.01
@@ -288,7 +288,6 @@ RADAR_COUNT = 500
 PLANNING_INTERVAL_S = 0.25
 STATUS_INTERVAL_S = 1.0
 ACTUATOR_PERIOD_S = 1.0 / 60.0  # installed JetSelectionActuator LoopFreqHz; idle torque calibration
-COAST_SPEED_M_S = 10.0  # initial closing-speed target; timed trims after the main burn
 
 
 def LimitVector(vector: npt.NDArray, limit: float) -> npt.NDArray:
@@ -377,8 +376,8 @@ if not (np.isfinite(linear_limit) and linear_limit > 0.0
     raise ValueError("Invalid shuttle acceleration limits")
 model = MissionModel(planning_accel=min(.12, .5 * linear_limit),
                      avoidance_accel=min(.09, linear_limit),
-                     coast_speed=COAST_SPEED_M_S,
                      cruise_burns=True,
+                     score_cruise=True,
                      fuel_per_dv=1.3 * shuttle.getMass() / (80.0 * 9.8))
 try:
     phobos_mu = phobos.GetParam(st.VarType.double, ["Dynamics", "GravitationalParameter_km3_s2"]) * 1e9
@@ -533,14 +532,22 @@ while not exit_flag:
                 nominal.acceleration = np.zeros(3)
                 nominal.mode = "SENSOR_COAST" if stale else "ACQUIRE"
                 nominal.burn_seconds, nominal.advantage = 0., 0.
+            launch = now < LAUNCH_PLAN_TIME and nominal.mode == "ACCELERATE"
+            departure = now < LAUNCH_PLAN_TIME or distance > .90 * guidance.launch_distance
+            horizon = guidance.departure_horizon(distance, relative_velocity @ goal) if departure else model.horizon
             scene = PredictionScene(tracker.tracks.values(), now, loc, vel, gravity, model,
-                                    horizon=min(model.horizon, nominal.eta + 1.0))
-            launch = now < LAUNCH_PLAN_TIME
+                                    horizon=min(horizon, nominal.eta + 1.0), departure=departure,
+                                    terminal=model.score_cruise and distance <= .30 * guidance.launch_distance)
+            # Pad lift is expressed in world axes and already works during the
+            # initial turn. Rear-only burns need the stricter attitude limit.
+            turn_limit = (2. if launch else 1.) * MAX_TURN_RAD_S
             plan = avoidance.choose(scene, nominal.acceleration, relative_velocity, goal, now,
                                     nose=current_axes[0], allow_forward=(nominal.mode not in ("ACQUIRE", "SENSOR_COAST")
-                                    and np.linalg.norm(omega_body) <= MAX_TURN_RAD_S),
+                                    and np.linalg.norm(omega_body) <= turn_limit),
                                     nominal_burn_seconds=nominal.burn_seconds or 8.,
                                     rear_guidance=not launch and np.linalg.norm(nominal.acceleration) > 0.,
+                                    transit_burn=(nominal.mode == "ACCELERATE" and
+                                                  guidance.transit_reason == "score favors burn"),
                                     launch=launch, coast_only=guidance.distance_coast,
                                     plan_on_coast=(LAUNCH_PLAN_TIME <= now < LAUNCH_PLAN_TIME + 2.
                                                    and tracker.fresh(now) and routes.action is None
@@ -567,6 +574,8 @@ while not exit_flag:
                 last_fault_log = now
         planner_ms = 1000.0 * (time.perf_counter() - started)
         next_plan = now + PLANNING_INTERVAL_S
+        if now < LAUNCH_PLAN_TIME and plan is not None and plan.mode == "AVOID":
+            next_plan = min(next_plan, LAUNCH_PLAN_TIME)
     if guidance.distance_coast:
         guidance.finish_burn(now)
         command = np.zeros(3)
@@ -584,12 +593,16 @@ while not exit_flag:
         guidance.finish_burn(now)
         command = np.zeros(3)
         mode, timed_burn = "TRIM_WAIT", False
-    forward_avoidance = (plan is not None and plan.forward_burn and mode == "AVOID"
+    angled_launch = (plan is not None and plan.launch_vector and mode == "AVOID" and now < LAUNCH_PLAN_TIME
+                     and now < avoidance_burn_until and tracker.fresh(now)
+                     and np.linalg.norm(omega_body) <= 2. * MAX_TURN_RAD_S)
+    forward_avoidance = (plan is not None and plan.forward_burn and not plan.launch_vector and mode == "AVOID"
                          and now < avoidance_burn_until and not mission_complete
                          and forward_ready)
-    full_thrust = (mode == "ACCELERATE" or timed_burn or forward_avoidance) and not mission_complete
+    vector_escape = forward_avoidance and plan.vector_escape
+    full_thrust = (mode == "ACCELERATE" or timed_burn or forward_avoidance or angled_launch) and not mission_complete
     route_rear = (mode == "ACCELERATE" and routes.action is not None and routes.action.rear_burn)
-    launch_burn = mode == "ACCELERATE" and now < LAUNCH_PLAN_TIME
+    launch_burn = (mode == "ACCELERATE" and now < LAUNCH_PLAN_TIME) or angled_launch
     rear_burn = full_thrust and not launch_burn
     pointing_axis = command / max(np.linalg.norm(command), 1e-12) if full_thrust else goal
     nose_error = math.acos(float(np.clip(current_axes[0] @ pointing_axis, -1., 1.)))
@@ -599,7 +612,7 @@ while not exit_flag:
     elif nose_error > nose_tolerance + math.radians(1. if rear_burn else 4.):
         alignment_engaged = True
     # Use a coasting handoff or a blocked forward corridor to finish pointing.
-    align_nose = (alignment_engaged and not quiet_coast and not mission_complete
+    align_nose = (alignment_engaged and not quiet_coast and not mission_complete and not vector_escape
                   and (full_thrust or mode in ("PLAN_COAST", "AVOID")))
     phase_priority = 1. if align_nose else 0.
     alignment_priority = alignment_strength(nose_error) * phase_priority
@@ -622,10 +635,17 @@ while not exit_flag:
     if mission_complete:
         alpha_body = np.zeros(3)
     linear_world = np.zeros(3)
-    if launch_burn:
-        # The pad starts broadside. Lift directly up the departure line while turning.
+    if vector_escape:
+        linear_world = command.copy()
+    elif launch_burn:
+        # The pad starts broadside. Preserve outward lift while aligning.
         if no_debris_test_mode or tracker.fresh(now):
-            linear_world = goal * linear_limit
+            # Once lift is established on a clear corridor, let the allocator
+            # give more authority to rotation while sustaining outward thrust.
+            clear_lift = (not angled_launch and relative_velocity @ goal > .1 and plan is not None
+                          and plan.baseline.clearance >= 2. * model.clearance)
+            lift_request = min(.12, linear_limit) if clear_lift else linear_limit
+            linear_world = (pointing_axis if angled_launch else goal) * lift_request
     elif rear_burn and forward_ready:
         axis = current_axes[0]
         route_live = not route_rear or now < routes.action.start + routes.action.duration
@@ -668,8 +688,11 @@ while not exit_flag:
                           fuel=fuel_used, damage=damage, score_if_arrived=model.score(now, fuel_used, damage),
                           eta=nominal.eta if nominal else math.inf,
                           full_thrust=int(full_thrust), coast_speed=model.coast_speed,
+                          transit_reason="arrived" if mission_complete else guidance.transit_reason,
+                          coast_arrival_s=None if mission_complete else guidance.coast_arrival,
                           route=routes.action.name if routes.action else "direct", route_reason=routes.reason,
-                          cruise_reason=routes.cruise_reason, launch_burn=int(launch_burn),
+                          cruise_reason=guidance.transit_reason if model.score_cruise else routes.cruise_reason,
+                          launch_burn=int(launch_burn),
                           pending_route=routes.pending.name if routes.pending is not None else '',
                           progress=1. - distance / max(guidance.launch_distance, 1e-9), distance_coast=int(guidance.distance_coast),
                           route_review_t=routes.review_time, route_ms=route_ms, route_unresolved=len(routes.risk.unresolved),
@@ -689,9 +712,11 @@ while not exit_flag:
                           route_leg_left_s=max(0., routes.action.start + routes.action.duration - now) if routes.action else 0.,
                           guidance_burn_s=guidance.remaining_burn(now, relative_velocity, gravity),
                           guidance_burn_plans=guidance.burn_count,
-                          reburn_advantage=nominal.advantage if nominal else 0.,
+                          reburn_advantage=(guidance.reburn_advantage
+                                            if guidance.transit_reason in ("score favors burn", "score favors coast")
+                                            else None),
                           avoidance_strategy=plan.strategy if plan else "GUIDANCE",
-                          avoidance_burn_s=max(0., avoidance_burn_until - now) if forward_avoidance else 0.,
+                          avoidance_burn_s=max(0., avoidance_burn_until - now) if forward_avoidance or angled_launch else 0.,
                           forward_avoidance=int(forward_avoidance),
                           body_lateral_command=float(np.linalg.norm(np.asarray(linear_body)[1:])),
                           speed_cutoff_reached=int(guidance.coast_latched),
@@ -714,6 +739,8 @@ while not exit_flag:
                           predicted_miss=encounter.miss_distance if encounter else math.inf,
                           clearance=encounter.clearance if encounter else math.inf, uncertainty=encounter.uncertainty if encounter else 0.,
                           threat_age=encounter.age if encounter else 0., baseline_clearance=plan.baseline.clearance if plan else math.inf,
+                          hull_gap=encounter.hull_gap if encounter else math.inf,
+                          baseline_hull_gap=plan.baseline.hull_gap if plan else math.inf,
                           candidates=plan.candidates if plan else 0, attitude_error_deg=math.degrees(attitude_error),
                           spin_deg_s=math.degrees(np.linalg.norm(omega_body)), linear_on=int(np.linalg.norm(linear_world) > 0.),
                           angular_on=int(np.linalg.norm(angular_world) > 0.), linear_switches=linear_switches,

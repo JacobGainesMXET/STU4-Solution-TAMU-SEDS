@@ -55,6 +55,15 @@ class TrackingTests(unittest.TestCase):
         np.testing.assert_allclose(velocity, [5., 0., 0.])
         self.assertIsNone(self.history.at(-2.))
 
+    def test_delayed_pad_start_can_use_the_initial_radar_sweep(self):
+        history = StateHistory()
+        history.add(.75, np.array([.015, 0., 0.]), np.array([.02, 0., 0.]))
+        self.tracker.update([self.observation(0.)], .8, history, np.zeros(3))
+        self.assertEqual(len(self.tracker.tracks), 1)
+        moving = StateHistory()
+        moving.add(.75, np.zeros(3), np.array([3., 0., 0.]))
+        self.assertIsNone(moving.at(0.))
+
     def test_old_positions_are_corrected_for_own_ship_motion(self):
         for stamp in (0., 4., 8.):
             self.tracker.update([self.observation(stamp)], stamp + 2., self.history, np.zeros(3))

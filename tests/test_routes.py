@@ -8,6 +8,27 @@ from RoutePlanner import Maneuver, RadarField, Risk, RoutePlanner, forecast
 
 
 class RouteTests(unittest.TestCase):
+    def test_covariance_shortlist_preserves_clearance_and_unresolved_tracks(self):
+        from pathlib import Path
+        from compare_routes import load_module
+        source = Path(__file__).resolve().parents[1] / 'comparison/pre_score_optimization/RoutePlanner.py'
+        reference = load_module(source, 'before_score_routes_check')
+        rng = np.random.default_rng(37)
+        tracks = [self.encounter(3*(1+i%32), rng.normal(0., 25., 3), i) for i in range(75)]
+        for t in tracks[::6]:
+            t.covariance *= 100.
+        field = RadarField(tracks, self.start, self.zero, self.zero, self.g, self.model)
+        for duration in (24., self.direct.eta):
+            path = forecast(self.guide, self.r, self.v, self.g, self.ref, self.start, 4., None)
+            path.eta = duration
+            path.positions = path.positions[:int(duration//3)+2]
+            expected = reference.RadarField.assess(field, path)
+            actual = field.assess(path)
+            for key in ('threat_ids', 'unresolved', 'track', 'approaching_at_horizon'):
+                self.assertEqual(getattr(actual, key), getattr(expected, key))
+            np.testing.assert_allclose([actual.clearance, actual.miss, actual.sigma, actual.t],
+                                       [expected.clearance, expected.miss, expected.sigma, expected.t])
+
     def setUp(self):
         self.model = MissionModel(planning_accel=.1, cruise_burns=True, coast_speed=10.)
         self.guide = AccelerationGuidance(self.model)

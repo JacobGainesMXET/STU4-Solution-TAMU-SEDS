@@ -25,6 +25,52 @@ class BurnCoastBurnTests(unittest.TestCase):
     def start_coast(self):
         return self.decide(1300., [10., 0., 0.], time=0.)
 
+    def test_time_target_coasts_below_old_speed_if_arrival_is_on_time(self):
+        self.model.arrival_target = 150.
+        decision = self.decide(1000., [8., 0., 0.], time=20.)
+        self.assertEqual(decision.mode, 'CLEAR_COAST')
+        self.assertAlmostEqual(self.guidance.coast_arrival, 139.75)
+
+    def test_time_target_continues_above_ten_when_gravity_delays_entry(self):
+        self.model.arrival_target = 150.
+        decision = self.decide(1000., [11., 0., 0.], time=62., gravity=[-.01, 0., 0.])
+        self.assertEqual(decision.mode, 'ACCELERATE')
+        self.assertGreater(self.guidance.coast_arrival, 150.)
+
+    def test_time_target_rechecks_after_a_delay_without_cycling_at_deadline(self):
+        self.model.arrival_target = 150.
+        for t, expected in [(58., 'CLEAR_COAST'), (60., 'CLEAR_COAST'), (61., 'ACCELERATE')]:
+            self.assertEqual(self.decide(962., [10., 0., 0.], time=t).mode, expected)
+
+    def test_time_target_reserves_fuel_and_keeps_course_trim_for_a_miss(self):
+        self.model.arrival_target = 150.
+        decision = self.decide(1000., [10., 0., 0.], time=95., fuel=70.)
+        self.assertEqual(decision.mode, 'CLEAR_COAST')
+        self.assertEqual(self.guidance.transit_reason, 'maneuver reserve')
+        miss = self.decide(1000., [10., 1., 0.], time=96., fuel=70.)
+        self.assertEqual(miss.mode, 'TRIM_BURN')
+
+    def test_infeasible_deadline_declines_low_value_speed_burn(self):
+        self.model.arrival_target = 150.
+        self.assertEqual(self.decide(500., [12., 0., 0.], time=150.).mode, 'CLEAR_COAST')
+        self.assertEqual(self.guidance.transit_reason, 'low time saving')
+
+    def test_same_impulse_has_less_score_value_after_an_avoidance_delay(self):
+        self.model.score_cruise = True
+        self.assertEqual(self.decide(800., [8., 0., 0.], time=25.).mode, 'ACCELERATE')
+        self.assertGreater(self.guidance.reburn_advantage, 0.)
+        self.assertEqual(self.decide(800., [8., 0., 0.], time=100.).mode, 'CLEAR_COAST')
+        self.assertLess(self.guidance.reburn_advantage, 0.)
+
+    def test_score_policy_can_recover_a_missed_flyby_beyond_70_percent(self):
+        self.model.score_cruise = True
+        self.guidance.observe_distance(1300.)
+        miss = self.decide(340., [8., 2., 0.], time=130.)
+        self.assertEqual(miss.mode, 'TRIM_BURN')
+        self.assertFalse(self.guidance.distance_coast)
+        coast = self.decide(320., [8., 0., 0.], time=132.)
+        self.assertEqual(coast.mode, 'CLEAR_COAST')
+
     def test_launch_does_not_coast_early_just_because_eight_meter_path_can_arrive(self):
         decision = self.decide(500., [8., 0., 0.])
         self.assertEqual(decision.mode, 'ACCELERATE')

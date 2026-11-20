@@ -1,6 +1,46 @@
 # Predictive burn-coast-burn guidance
 
-## Current controller — straight launch and timing-based avoidance
+## Active score policy
+
+Both local competition configurations and the no-debris configuration run the team checkout's
+`Controller.py`. The active `MissionModel` enables `score_cruise`. The fixed-speed and
+150-second policies remain available for comparisons. The scored policy prices a two-second
+forward burn through entry into the target sphere and coasts when the predicted fuel cost
+exceeds the time reward. The crew can still trim a missed flyby or avoid a collision after
+70% progress. `transit_reason`, `coast_arrival_s`, `reburn_advantage`, `avoidance_strategy`
+and `hull_gap` explain those decisions in telemetry.
+
+Normal flight uses outward pad lift, followed by nose-axis translation and a quiet ballistic
+coast. A predicted close hull pass with inadequate forward options can trigger a bounded
+oblique `VECTOR_ESCAPE` through the installed jet allocator. The nose holds during this impulse.
+The current validation results, simulator comparisons and rollback source are in
+[the controller audit](CONTROLLER_AUDIT.md).
+
+## Current launch policy
+
+The controller checks the direct departure against radar as soon as it can use a sweep.
+It can reconstruct a timestamp-zero return when the first ownship sample arrives within
+one second of launch and the measured speed is at most 0.1 m/s. During pad lift a
+blocked direct burn can be replaced by a coast or a 6°, 12°, or 20° outward burn.
+The allocator receives the selected acceleration in shuttle coordinates and attitude
+guidance aims along that burn. A 20° request still directs 94% of its magnitude
+toward the target. The pad starts broadside, so even straight lift can use body-side jets.
+Rear-only translation takes over at the 20 s handoff.
+
+Near departure the radar forecast can extend from 30 to 45 s for repeatedly observed
+tracks with bounded covariance. The horizon contracts as the shuttle leaves the
+first 10% of its route. Launch clearance includes the displacement range for different
+delivered lift magnitudes. When every option has an uncertainty overlap, the controller
+protects the closest modeled hull pass and retains the selected heading on near ties.
+Telemetry records both `baseline_hull_gap` and `hull_gap` in metres. These are predictions.
+`LAUNCH_TILT` and `LAUNCH_COAST` identify early interventions. A
+`_LIMITED_CLEARANCE` suffix means the chosen option still had forecast risk.
+
+Commit `b9dc3d2` contains the flight controller used in the previous live series.
+The current controller requires a new Space Teams comparison. In particular, check
+first damage, early clearance, fuel at 20 s and arrival, and official score.
+
+## Previous controller — straight launch and timing-based avoidance
 
 The five November 19 flight logs from 09:33–09:46 UTC match the reported arrival
 fuel and the source hashes in `comparison/pre_straight_launch/`. Mean official time

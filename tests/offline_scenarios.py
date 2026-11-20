@@ -35,9 +35,12 @@ def previous_helpers():
 
 
 def run(previous=False, obstacle=None, seed=7, coast_speed=10., cruise_burns=True,
-        plant_accel=.14, gravity=None, plan_routes=True, obstacles=None):
+        plant_accel=.14, gravity=None, plan_routes=True, obstacles=None, arrival_target=None, score_cruise=False):
     rocks = list(obstacles) if obstacles is not None else ([] if obstacle is None else [obstacle])
-    model = MissionModel(coast_speed=coast_speed, cruise_burns=cruise_burns and coast_speed is not None)
+    model = MissionModel(coast_speed=coast_speed if arrival_target is None and not score_cruise else None,
+                         cruise_burns=cruise_burns and (coast_speed is not None or arrival_target is not None))
+    model.arrival_target = arrival_target
+    model.score_cruise = score_cruise
     history, tracker = StateHistory(), RadarTracker(model)
     guidance, avoidance = AccelerationGuidance(model), AvoidancePlanner(model)
     forward_only = not previous and hasattr(guidance, 'observe_distance')
@@ -108,16 +111,28 @@ def run(previous=False, obstacle=None, seed=7, coast_speed=10., cruise_burns=Tru
                                               nose, fuel, known_empty=not rocks)
                 else:
                     routes.interrupt(now, 'tactical or nominal priority')
-                scene = PredictionScene(tracker.tracks.values(), now, position, velocity, gravity, model)
+                scene_options = {}
+                if hasattr(guidance, 'departure_horizon'):
+                    distance = np.linalg.norm(relative)
+                    scene_options['departure'] = now < LAUNCH_PLAN_TIME or distance > .90 * guidance.launch_distance
+                    closing = (velocity - target_velocity) @ (relative / distance)
+                    scene_options['horizon'] = min(guidance.departure_horizon(distance, closing), decision.eta + 1.)
+                    if score_cruise:
+                        scene_options['terminal'] = distance <= .30 * guidance.launch_distance
+                scene = PredictionScene(tracker.tracks.values(), now, position, velocity, gravity, model, **scene_options)
                 options = dict(nominal_burn_seconds=decision.burn_seconds or 8.) if hasattr(guidance, 'burn') else {}
                 if routes.action is not None and routes.action.rear_burn and decision.mode == 'ACCELERATE':
                     options.update(rear_guidance=True, nose=nose)
                 if forward_only:
-                    options.update(launch=now < LAUNCH_PLAN_TIME, coast_only=guidance.distance_coast,
+                    options.update(launch=now < LAUNCH_PLAN_TIME and decision.mode == 'ACCELERATE',
+                                   coast_only=guidance.distance_coast,
                                    plan_on_coast=(LAUNCH_PLAN_TIME <= now < LAUNCH_PLAN_TIME + 2.
                                                   and bool(rocks) and routes.action is None and decision.mode == 'ACCELERATE'),
                                    rear_guidance=now >= LAUNCH_PLAN_TIME and bool(np.any(decision.acceleration)),
                                    nose=nose)
+                    if arrival_target is not None or score_cruise:
+                        options['transit_burn'] = (decision.mode == 'ACCELERATE' and
+                                                   guidance.transit_reason in ('build closing speed', 'score favors burn'))
                 selected = avoidance.choose(scene, decision.acceleration, velocity - target_velocity, relative, now, **options)
                 if selected.mode in ('AVOID', 'EMERGENCY') and hasattr(guidance, 'finish_burn'):
                     guidance.finish_burn(now)
@@ -146,15 +161,19 @@ def run(previous=False, obstacle=None, seed=7, coast_speed=10., cruise_burns=Tru
                 goal = relative / np.linalg.norm(relative)
                 command = np.zeros(3)
                 if not guidance.distance_coast and now < burn_end:
-                    if now < LAUNCH_PLAN_TIME and full_thrust:
-                        command = plant_accel * goal
-                    elif np.any(desired) or selected.mode in ('PLAN_COAST', 'AVOID'):
+                    if np.any(desired) or selected.mode in ('PLAN_COAST', 'AVOID'):
                         axis = desired / np.linalg.norm(desired) if np.any(desired) else goal
+                        launch_lift = now < LAUNCH_PLAN_TIME and full_thrust
                         angle = math.acos(float(np.clip(nose @ axis, -1., 1.)))
-                        rate = model.avoidance_turn_rate if route_rear or selected.forward_burn else math.radians(3.)
-                        nose += min(1., rate * dt / max(angle, 1e-8)) * (axis - nose)
-                        nose /= np.linalg.norm(nose)
-                        if np.any(desired):
+                        rate = model.avoidance_turn_rate if (route_rear or selected.forward_burn) and not launch_lift else math.radians(3.)
+                        if not getattr(selected, 'vector_escape', False):
+                            nose += min(1., rate * dt / max(angle, 1e-8)) * (axis - nose)
+                            nose /= np.linalg.norm(nose)
+                        if getattr(selected, 'vector_escape', False):
+                            command = plant_accel * axis
+                        elif launch_lift:
+                            command = plant_accel * (axis if getattr(selected, 'launch_vector', False) else goal)
+                        elif np.any(desired):
                             command = rear_thrust(plant_accel * axis, nose, goal, velocity - target_velocity)
             elif route_rear:
                 axis = desired / np.linalg.norm(desired)
@@ -196,9 +215,9 @@ if __name__ == '__main__':
     parser.add_argument('--sweep', action='store_true', help='Compare illustrative coast thresholds on the synthetic plant')
     arguments = parser.parse_args()
     report = dict(evidence='Synthetic point-mass, constant gravity, ideal fuel, approximate attitude; not Space Teams',
-                  previous_clear=run(previous=True), revised_clear=run(),
-                  revised_head_on=run(obstacle=([500., 0., 0.], [-1., 0., 0.])),
-                  revised_crossing=run(obstacle=([420., 100., 0.], [-.2, -1.13, 0.])))
+                  previous_clear=run(previous=True), revised_clear=run(score_cruise=True),
+                  revised_head_on=run(obstacle=([500., 0., 0.], [-1., 0., 0.]), score_cruise=True),
+                  revised_crossing=run(obstacle=([420., 100., 0.], [-.2, -1.13, 0.]), score_cruise=True))
     if arguments.sweep:
         report['synthetic_coast_thresholds'] = {str(speed): run(coast_speed=speed)
                                                 for speed in (6., 8., 10., 12.)}

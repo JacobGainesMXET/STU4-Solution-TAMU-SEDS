@@ -9,7 +9,8 @@ from pathlib import Path
 
 class FlightRecorder:
     fields = ('t', 'mode', 'no_debris_test', 'distance', 'speed', 'closing_speed', 'fuel', 'damage', 'score_if_arrived',
-              'eta', 'full_thrust', 'coast_speed', 'speed_cutoff_reached', 'velocity_error_deg',
+              'eta', 'full_thrust', 'coast_speed', 'transit_reason', 'coast_arrival_s',
+              'speed_cutoff_reached', 'velocity_error_deg',
               'guidance_burn_s', 'guidance_burn_plans', 'reburn_advantage',
               'route', 'route_reason', 'cruise_reason', 'launch_burn', 'pending_route', 'progress', 'distance_coast',
               'route_tracks', 'route_candidates', 'route_eta_s',
@@ -27,7 +28,7 @@ class FlightRecorder:
               'nose_tolerance_deg', 'quiet_coast', 'coast_entry_s',
               'tracks', 'confirmed', 'radar_age',
               'rejected', 'ambiguous', 'threat_id', 'ttc', 'cpa_time', 'predicted_miss',
-              'clearance', 'uncertainty', 'threat_age', 'baseline_clearance', 'candidates',
+              'clearance', 'uncertainty', 'threat_age', 'baseline_clearance', 'hull_gap', 'baseline_hull_gap', 'candidates',
               'attitude_error_deg', 'spin_deg_s', 'linear_on', 'angular_on', 'linear_switches',
               'angular_switches', 'coast_fraction', 'fuel_per_dv', 'planning_accel', 'planner_ms',
               'x', 'y', 'z', 'vx', 'vy', 'vz', 'gx', 'gy', 'gz',
