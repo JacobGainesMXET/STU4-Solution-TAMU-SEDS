@@ -6,6 +6,7 @@ plant has no contact response, damage model or launchpad constraint.
 """
 import argparse
 from contextlib import ExitStack
+import csv
 import json
 from pathlib import Path
 import sys
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def compare(previous, through_arrival, before_transit=False, *, before_score=False,
             scene=None, seed=7, attitude='flight', packages=None, main_burn_until=None, pause=None,
-            delayed_radar=False, controller_dir=None, controller_hz=None):
+            delayed_radar=False, controller_dir=None, controller_hz=None, recorded_launch=None):
     directory = controller_dir.resolve() if controller_dir is not None else ROOT
     if previous:
         directory = ROOT / 'comparison/pre_forward_only'
@@ -39,10 +40,14 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
 
     AllocatorResponseTests.setUpClass()
     jets = AllocatorResponseTests()
+    # Classify by the physical force axes before any test-only change of basis.
+    jet_force = jets.mass * np.linalg.norm(jets.activity[:, :3], axis=1)
+    bottom = jets.mass * jets.activity[:, 2] > .99 * jet_force
     gravity = np.array([-.006, 0., 0.])
     origin = np.array([0., 0., -10000.])
     departure_axis = np.array([1., 0., 0.])
     environment = None
+    display_threshold = None
     if packages is not None:
         from audit_coasts import Environment, FINAL_CONFIG, MU
         from scipy.spatial.transform import Rotation
@@ -52,6 +57,7 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
             controller_hz = float(controller_system['Inst_Parameters']['LoopFreqHz'])
         entities = {e['#Required']['Name']: e for e in config['DataManager']['entities']}
         shuttle, cycler = entities['SpaceBuggy'], entities['AsteroidCycler']
+        display_threshold = shuttle['JetSelection']['RCSMinOnTime']
         origin = np.array(shuttle['Location'][1:])
         target_position = np.array(cycler['Location'][1:])
         departure_axis = Guidance.unit(target_position - origin)
@@ -91,6 +97,12 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
         peak_closing = 0.
         min_gap = float('inf')
         peak_launch_spin = 0.
+        peak_hull_rotation = 0.
+        first_translation = None
+        bottom_fuel = 0.
+        other_plume_seconds = 0.
+        current_other_plume = 0.
+        longest_other_plume = 0.
 
         def target_state(self):
             if environment is None:
@@ -145,6 +157,8 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
             gap = np.linalg.norm(self.target_state().loc_WRT_ExprIn(None) - self.position)
             if self.now >= (350. if through_arrival else 60.) or gap <= 50.:
                 raise StopLoop()
+            if self.first_translation is None and np.any(self.command):
+                self.first_translation = self.now
             rhs = np.r_[self.command, self.angular]
             times = np.zeros(len(jets.activity))
             if np.linalg.norm(rhs) > 1e-9:
@@ -157,11 +171,26 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
                 times = solution.x
             impulse, kg = jets.helpers['GetEffectiveImpulseAndFuelUse'](
                 jets.activity, jets.mass, jets.inertia, times, jets.period)
+            # The installed allocator scales every selected jet's on-time by
+            # one common factor. Its share of fuel equals its share of impulse.
+            spent = np.maximum(times, 0.) * jet_force
+            if kg > 0.:
+                self.bottom_fuel += kg * dt / jets.period * spent[bottom].sum() / spent.sum()
+            if display_threshold is not None:
+                lit = jets.helpers['GetThrustersToFire'](times, display_threshold, jets.period)
+                if any(not bottom[i] for i in lit):
+                    self.other_plume_seconds += dt
+                    self.current_other_plume += dt
+                    self.longest_other_plume = max(self.longest_other_plume, self.current_other_plume)
+                else:
+                    self.current_other_plume = 0.
             external = environment.body_acceleration(self.now, self.position, self.velocity) if environment else gravity
             accel = self.rotation @ impulse[:3] / (jets.mass * jets.period) + external
             torque = impulse[3:] / jets.period - np.cross(self.spin, jets.inertia @ self.spin)
             self.spin += np.linalg.solve(jets.inertia, torque) * dt
             self.rotation = self.rotation @ active_rotation(self.spin * dt)
+            hull_angle = np.degrees(np.arccos(np.clip((np.trace(initial.T @ self.rotation) - 1.) / 2., -1., 1.)))
+            self.peak_hull_rotation = max(self.peak_hull_rotation, hull_angle)
             self.position += self.velocity*dt + .5*accel*dt**2
             self.velocity += accel*dt
             self.fuel += kg * dt / jets.period
@@ -198,10 +227,27 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
         initial = initial @ basis
         jets.activity = np.column_stack((jets.activity[:, :3] @ basis, jets.activity[:, 3:] @ basis))
         jets.inertia = basis.T @ jets.inertia @ basis
-    launch = Launch(no_debris_test=not rocks, rotation=initial)
+    launch = Launch(no_debris_test=not rocks, rotation=initial, low_tilt=attitude == 'low-tilt',
+                    bottom_lift=attitude == 'bottom-lift')
     if environment:
         launch.position = origin.copy()
         launch.phobos_mu_km3_s2 = MU / 1e9
+    if recorded_launch is not None:
+        if not environment or rocks:
+            raise ValueError('Recorded starts require final gravity and an empty field')
+        with recorded_launch.open(newline='') as stream:
+            pad = None
+            for row in csv.DictReader(stream):
+                if float(row['fuel']) > 0.:
+                    break
+                pad = row
+            else:
+                raise ValueError('Recording contains no powered departure')
+        if pad is None or float(pad['hull_rotation_deg']) > .2 or float(pad['damage']) > 0.:
+            raise ValueError('Expected an undamaged pre-burn sample at the launch attitude')
+        launch.position = np.array([float(pad[k]) for k in ('x', 'y', 'z')])
+        launch.velocity = np.array([float(pad[k]) for k in ('vx', 'vy', 'vz')])
+        launch.now = float(pad['t'])
     if delayed_radar:
         own_history.add(launch.now, launch.position, launch.velocity)
     with ExitStack() as context:
@@ -230,7 +276,13 @@ def compare(previous, through_arrival, before_transit=False, *, before_score=Fal
     print('time_s, fuel_kg, closing_m_s, nose_deg')
     print('controller Hz', launch.get_param(None, 'LoopFreqHz'))
     print('at 20 s', launch.at_20, 'at 3 m/s', launch.at_speed)
+    print('first translation (s)', launch.first_translation, 'peak hull rotation (deg)', round(launch.peak_hull_rotation, 2))
     print('peak launch spin (deg/s)', round(launch.peak_launch_spin, 2))
+    print('bottom jet fuel (kg)', round(launch.bottom_fuel, 3),
+          'other jet fuel (kg)', round(launch.fuel - launch.bottom_fuel, 3))
+    if display_threshold is not None:
+        print('other plume indicated (s)', round(launch.other_plume_seconds, 2),
+              'longest continuous indication (s)', round(launch.longest_other_plume, 2))
     if through_arrival:
         gap = np.linalg.norm(launch.target_state().loc_WRT_ExprIn(None) - launch.position)
         print('arrival', gap <= 50., 'time', round(launch.now, 2), 'fuel', round(launch.fuel, 2))
@@ -251,11 +303,13 @@ if __name__ == '__main__':
     parser.add_argument('--scene', choices=('clear-corridor', 'launch-crossing', 'late-launch-crossing',
                                             'head-on', 'crossings', 'offset-crossings'))
     parser.add_argument('--seed', type=int, default=7)
-    parser.add_argument('--attitude', choices=('flight', 'hold', 'top', 'aligned'), default='flight')
+    parser.add_argument('--attitude', choices=('flight', 'hold', 'top', 'aligned', 'low-tilt', 'bottom-lift'), default='flight')
     parser.add_argument('--through-arrival', action='store_true')
     parser.add_argument('--final-gravity', type=Path, metavar='PACKAGES',
                         help='Use the final departure pose and SPICE gravity from Compute_Server/packages.')
     parser.add_argument('--controller-hz', type=float, help='Override the controller rate for timing sensitivity tests.')
+    parser.add_argument('--recorded-launch', type=Path, metavar='TELEMETRY_CSV',
+                        help='Start the empty-field plant at the last recorded zero-fuel pose and velocity.')
     parser.add_argument('--main-burn-until', type=float, metavar='SECONDS',
                         help='Experiment with a fixed main-burn cutoff. Flyby correction stays active.')
     parser.add_argument('--pause', type=float, nargs=2, metavar=('START', 'END'),
@@ -273,4 +327,5 @@ if __name__ == '__main__':
     compare(args.previous, args.through_arrival, args.before_transit, before_score=args.before_score,
             scene=args.scene, seed=args.seed, attitude=args.attitude, packages=args.final_gravity,
             main_burn_until=args.main_burn_until, pause=args.pause, delayed_radar=args.delayed_radar,
+            recorded_launch=args.recorded_launch,
             controller_dir=args.controller_dir, controller_hz=args.controller_hz)

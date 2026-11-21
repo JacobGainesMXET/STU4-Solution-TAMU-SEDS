@@ -105,7 +105,7 @@ def forecast(guidance, r, v, gravity, reference, now, fuel, action, nose=None):
             goal = unit(remaining)
             route_burn = (action is not None and action.rear_burn and decision.mode == 'ACCELERATE'
                           and action.start <= clock < action.start + action.duration)
-            if np.any(accel):
+            if np.any(accel) and not model.low_tilt:
                 desired = unit(accel)
                 error = math.acos(float(np.clip(heading @ desired, -1., 1.)))
                 turn_time = dt

@@ -19,7 +19,7 @@ class AllocatorResponseTests(unittest.TestCase):
     def setUpClass(cls):
         root = Path(__file__).resolve().parents[2] / 'STU4-Sim'
         source = root / 'Systems/JetSelectionActuator.py'
-        names = {'ComputeActivityVectors', 'GetEffectiveImpulseAndFuelUse', 'remap'}
+        names = {'ComputeActivityVectors', 'GetEffectiveImpulseAndFuelUse', 'GetThrustersToFire', 'remap'}
         nodes = [node for node in ast.parse(source.read_text()).body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
         cls.helpers = {'np': np}

@@ -28,6 +28,19 @@ class ForwardAvoidanceTests(unittest.TestCase):
         np.testing.assert_allclose(instant[:, 0], [0., .24, 1.68, 2.16])
         np.testing.assert_array_equal(instant, delayed)
 
+    def test_airborne_low_tilt_rechecks_a_late_closing_first_return_through_next_sweep(self):
+        model = MissionModel(low_tilt=True, process_accel_sigma=0.)
+        def coast(speed, relative_speed):
+            rock = track(42. * self.goal, (speed + relative_speed) * self.goal, hits=1)
+            scene = PredictionScene([rock], 0., self.zero, speed * self.goal, self.zero, model,
+                                    departure=True, lift_axis=self.goal)
+            return scene.assess(self.zero)
+        self.assertGreater(coast(0., -3.).clearance, 0.)
+        incoming = coast(1., -3.)
+        self.assertLess(incoming.hull_gap, 0.)
+        self.assertGreater(incoming.time, 8.)
+        self.assertGreater(coast(1., 3.).clearance, 0.)
+
     def test_delayed_turn_does_not_assume_instantaneous_sideways_thrust(self):
         angle = math.radians(20.)
         acceleration = .12 * np.array([math.cos(angle), math.sin(angle), 0.])

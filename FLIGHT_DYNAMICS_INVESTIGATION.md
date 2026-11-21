@@ -1,5 +1,41 @@
 # Escape from Phobos flight dynamics and score investigation
 
+## Bottom-thruster launch trial
+
+Open `BOTTOM_LIFT_NO_DEBRIS_TEST.simconf` for the empty field or `BOTTOM_LIFT_DEBRIS_TEST.simconf` for the final debris field. Both load the team controller at 60 Hz. The earlier low-tilt scenes remain available for a paired comparison.
+
+Four official low-tilt no-debris scores on November 20 were 54.2, 53.3, 54.4 and 54.6. The 54.6 flight used 38.18 kg and finished in 216.23 s. Its telemetry already showed 38.18 kg at the beginning of the long coast. This motivated changing how the shuttle delivers the main impulse.
+
+On a clear direct ascent, the controller requests acceleration 0.05° forward of body +Z. The installed allocator can combine lift and torque using the bottom jets at that angle. During departure, the controller evaluates straight burns followed by coasts using the remaining displacement, target-relative velocity, gravity and measured fuel price. The best predicted score supplies the hull aiming direction, capped to 7.5° of rotation from the pad. Once the ship is moving, the controller can estimate the component of gravity perpendicular to a burn from the measured velocity change. The existing score cutoff still determines when thrust ends. If radar identifies a potential encounter or the route planner selects a maneuver, the avoidance system retains control of the thrust direction.
+
+In the debris scene, the shuttle uses its existing low-tilt liftoff while nearby traffic is first being observed. It can switch to the more efficient burn on a clear direct leg after one hull diameter of progress toward the target (5 m), or after every current track has three reliable observations. The explicitly empty practice scene can use the efficient burn immediately.
+
+| 60 Hz offline run | Arrival | Fuel | Fuel through other jets | Score |
+|---|---:|---:|---:|---:|
+| Earlier low tilt, empty field | 210.58 s | 38.12 kg | 0.806 kg | 56.16 |
+| Bottom lift, empty field | 200.70 s | 38.44 kg | 0.034 kg | 58.53 |
+| Bottom lift, clear corridor with radar returns | 204.32 s | 38.39 kg | 0.277 kg | 57.55 |
+
+In the empty field the hull rotated at most 6.55°. No non-bottom jet crossed the actuator's visible-plume threshold. The fuel columns use the individual jet impulses, including subthreshold firings. Starting the offline plant from the last zero-fuel telemetry sample of each of the four live flights gave 58.06–58.13 with bottom lift and 55.85–56.00 with the earlier profile. These replays use recorded initial position, velocity and elapsed time. The remaining flight is simulated, including jet allocation and rotating-frame gravity. The bench omits pad contact and asynchronous processes in Space Teams.
+
+In the same 11 synthetic obstacle trials used for low tilt, both profiles reached the target in all 11 and cleared the modeled hulls in 10. Delayed launch seed 101 still overlapped by 0.01 m, and seed 29 passed by 0.09 m. Delayed multi-crossing seed 13 improved from 43.92 to 44.95. Offset-crossing seed 101 fell from 34.18 to 31.60 and used 61.82 kg. The largest measured gains came on clear departures.
+
+To reproduce the empty run, use the simulator Python with `tests/check_launch_fuel.py --through-arrival --final-gravity D:/Main/Compute_Server/packages --attitude bottom-lift`. For a recorded start, add `--recorded-launch diagnostics/20261120T222654_114471Z/telemetry.csv`. For a live run, `bottom_lift_burn` identifies the efficient burn in telemetry and `thrust_from_lift_axis_deg` reports the requested thrust angle from body +Z.
+
+## Low-tilt flight comparison
+
+Open `LOW_TILT_NO_DEBRIS_TEST.simconf` for the clear run and `LOW_TILT_DEBRIS_TEST.simconf` for the debris run. Both load the team controller at 60 Hz. Each local test scene adds one controller flag to its corresponding scene. The regular flight profile is preserved at `1e53b9a`, Jacob's 51.7-point controller.
+
+The alternate controller measures attitude from the launch pose and holds one reference throughout the flight. It tilts the top of the shuttle toward the departure corridor, with a 7.5° cap on the commanded hull rotation. The jet allocator can deliver upward thrust on the first clear control tick and steer the velocity vector during an avoidance burn. Small damped attitude commands arrest residual rotation during coast. Read `hull_rotation_deg` in the flight CSV to see how far the vehicle actually rotated. The `nose_error_deg` column measures a different angle and can stay near 90° during a good ascent.
+
+In the 60 Hz clear-field bench the regular profile rotated 96.63°, reached the target in 198.70 s, used 41.00 kg and scored 55.73. The alternate profile rotated 5.27°, arrived in 210.58 s, used 38.12 kg and scored 56.16. Both started translating on the first tick. At 20 s the alternate was closing at 2.13 m/s on 10.60 kg compared with 1.87 m/s on 10.92 kg. A separate empty-field experiment extending the main burn to 72 s gave 195.37 s, 41.38 kg and 56.25 points. The selectable controller uses the adaptive score cutoff.
+
+When the shuttle is already climbing, the alternate planner checks a newly seen closing contact through 16 seconds. If coasting, straight thrust and shallow deflections all predict inadequate clearance, it evaluates wider outward thrust vectors. This cleared the delayed launch crossing for seeds 13 and 67 with 0.81 m and 2.77 m remaining. The regular controller overlapped the modeled rock by 2.50 m and 2.72 m on those same runs. Seed 29 passed by only 0.09 m, and an additional check on seed 101 had a 0.01 m overlap. Near-pad clearance remains a live-test priority.
+
+Across 11 offline flights with crossing or head-on obstacles, the alternate controller reached the target in all 11 and had positive modeled clearance in 10. Scores varied with geometry. Head-on seed 13 improved from 42.58 to 45.22, while delayed multi-crossing seed 13 fell from 49.32 to 43.92, largely because the alternate controller took 18.23 s longer. The narrow attitude profile is available for comparison before selecting a competition controller.
+
+To reproduce the clear comparison, run `tests/check_launch_fuel.py --through-arrival --final-gravity D:/Main/Compute_Server/packages` with the simulator Python and repeat with `--attitude low-tilt`. Add `--scene late-launch-crossing --seed 13 --delayed-radar` to exercise a newly seen obstacle after liftoff. The bench measures separation between modeled hulls. Space Teams runs are needed to measure pad contact, actual damage and official scores.
+
 ## Clear-flight launch profile now in the team controller
 
 Both final and no-debris configurations load the same team `Controller.py`. The previous flight sources are preserved at `5ea242d`. The investigation below this section describes that baseline. The new measurements are offline flights from the final launch pose using local gravity and the installed jet allocation equations.

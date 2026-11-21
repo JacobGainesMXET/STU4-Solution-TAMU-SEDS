@@ -273,7 +273,8 @@ if controller_directory not in sys.path:
 from Guidance import (MissionModel, StateHistory, RadarTracker, AccelerationGuidance,
                       PredictionScene, AvoidancePlanner,
                       AccelerationAttitude, limited, learn_burn_model, angular_command,
-                      alignment_strength, pointing_tolerance, rear_thrust, LAUNCH_PLAN_TIME)
+                      alignment_strength, pointing_tolerance, rear_thrust, low_tilt_target, departure_burn_direction,
+                      BOTTOM_LIFT_BIAS_DEG, LAUNCH_PLAN_TIME)
 from FlightRecorder import FlightRecorder
 from RoutePlanner import RoutePlanner
 
@@ -359,13 +360,24 @@ def ComputeAttitudeAcceleration(current_axes, target_axes, angular_velocity, acc
     return LimitVector(acceleration, accel_limit), angle
 
 
-# Explicitly enabled only by the separate no-debris test configuration. An empty
-# or failed radar in the normal competition must still inhibit blind acceleration.
+# Use the straight bottom-lift strategy by default. Named test scenes retain
+# their selected guidance profiles, including radar-driven avoidance.
+test_mode_params = ("NoDebrisTestMode", "RadarObservationPractice", "BottomLiftTestMode", "LowTiltTestMode")
+straight_flight = (this.GetParam(st.VarType.bool, "StraightFlight")
+                   if this.HasParam("StraightFlight")
+                   else not any(this.HasParam(param) for param in test_mode_params))
 no_debris_test_mode = (this.GetParam(st.VarType.bool, "NoDebrisTestMode")
                        if this.HasParam("NoDebrisTestMode") else False)
-if no_debris_test_mode:
+radar_observation_practice = (this.HasParam("RadarObservationPractice")
+                              and this.GetParam(st.VarType.bool, "RadarObservationPractice"))
+obstacle_free_guidance = straight_flight or no_debris_test_mode or radar_observation_practice
+if radar_observation_practice:
+    st.logger_info("Radar observation practice active. Guidance follows the clear-lane trajectory.")
+elif no_debris_test_mode:
     st.OnScreenLogMessage("No-debris TEST mode: guidance enabled without radar observations",
                           "Guidance", st.Severity.Info)
+elif straight_flight:
+    st.logger_info("Straight-flight strategy active. Radar is observation only.")
 
 # Read only own-ship properties and permitted target/planet state. Never read debris truth.
 linear_limit = shuttle.GetParam(st.VarType.double, ["Thrusters", "MaxAccel_m_s2"])
@@ -374,11 +386,19 @@ if not (np.isfinite(linear_limit) and linear_limit > 0.0
         and np.isfinite(angular_limit) and angular_limit > 0.0):
     SetCommand(np.zeros(3), np.zeros(3))
     raise ValueError("Invalid shuttle acceleration limits")
+bottom_lift = (this.GetParam(st.VarType.bool, "BottomLiftTestMode")
+               if this.HasParam("BottomLiftTestMode") else straight_flight)
 model = MissionModel(planning_accel=min(.12, .5 * linear_limit),
                      avoidance_accel=min(.09, linear_limit),
                      cruise_burns=True,
                      score_cruise=True,
+                     bottom_lift=bottom_lift,
+                     low_tilt=bottom_lift or (this.HasParam("LowTiltTestMode") and this.GetParam(st.VarType.bool, "LowTiltTestMode")),
                      fuel_per_dv=1.3 * shuttle.getMass() / (80.0 * 9.8))
+if model.low_tilt:
+    profile = "Bottom-lift" if bottom_lift else "Low-tilt"
+    st.OnScreenLogMessage(f"{profile} mode active. Hull angles are measured from the launch pose.",
+                          "Guidance", st.Severity.Info)
 try:
     phobos_mu = phobos.GetParam(st.VarType.double, ["Dynamics", "GravitationalParameter_km3_s2"]) * 1e9
 except Exception:
@@ -391,6 +411,7 @@ avoidance = AvoidancePlanner(model)
 linear_switches = 0
 angular_switches = 0
 attitude_reference = None
+launch_axes = None
 roll_reference = None
 previous_time = None
 previous_velocity = None
@@ -398,9 +419,13 @@ previous_omega_world = None
 previous_linear_command = np.zeros(3)
 previous_angular_command = np.zeros(3)
 external_residual = np.zeros(3)
+lift_residual = np.zeros(3)
+bottom_burn = False
+lift_bias = math.radians(BOTTOM_LIFT_BIAS_DEG)
 next_plan = -math.inf
 next_status = -math.inf
 last_fault_log = -math.inf
+last_radar_fault_log = -math.inf
 command = np.zeros(3)
 mode = "ACQUIRE"
 plan = None
@@ -465,7 +490,18 @@ while not exit_flag:
         residual = observed_dv / dt - central_gravity
         if np.linalg.norm(residual - external_residual) < .04:
             external_residual += -math.expm1(-dt / 2.0) * (residual - external_residual)
+            if bottom_lift and now < LAUNCH_PLAN_TIME:
+                lift_residual = external_residual.copy()
     gravity = central_gravity + external_residual
+    if (bottom_burn and now < LAUNCH_PLAN_TIME and previous_velocity is not None and 0. < dt < .5
+            and np.linalg.norm(vel - target_vel) > .25 and np.linalg.norm(previous_linear_command) > .01):
+        # The actuator's linear impulse follows the command. Its unknown
+        # magnitude drops out of the transverse gravity measurement.
+        axis = previous_linear_command / np.linalg.norm(previous_linear_command)
+        residual = observed_dv / dt - central_gravity - lift_residual
+        transverse = residual - (residual @ axis) * axis
+        if np.linalg.norm(transverse) < .02:
+            lift_residual += -math.expm1(-dt / 3.) * transverse
     measured_thrust_dv = observed_dv - gravity * dt if previous_velocity is not None else np.zeros(3)
     if np.linalg.norm(previous_linear_command) > 0.0:
         fuel_observer_dv += float(np.linalg.norm(measured_thrust_dv))
@@ -484,9 +520,17 @@ while not exit_flag:
     if guidance.distance_coast and not was_distance_coast:
         next_plan = now
         next_status = now
-    if attitude_reference is None:
-        attitude_reference = AccelerationAttitude(current_axes[0])
+    if launch_axes is None:
+        launch_axes = current_axes.copy()
         roll_reference = current_axes[1].copy()
+        if model.low_tilt:
+            pad_target_axes = low_tilt_target(launch_axes, goal)
+        else:
+            attitude_reference = AccelerationAttitude(current_axes[0])
+    thrust_axis = current_axes[2] if model.low_tilt else current_axes[0]
+    if bottom_lift:
+        lift_body = np.array([math.sin(lift_bias), 0., math.cos(lift_bias)])
+        lift_direction = current_axes.T @ lift_body
     # Success is position-only. Latch entry so passing the target does not trigger a
     # costly reversal/flip after the scorer has already accepted the run.
     if not mission_complete and distance <= model.success_radius:
@@ -495,11 +539,19 @@ while not exit_flag:
     if now >= next_plan and not mission_complete:
         started = time.perf_counter()
         quiet_coast = False
+        bottom_burn = False
         try:
             observations = []
-            if not no_debris_test_mode:
-                contacts = GetRadarContacts(RADAR_COUNT)
-                observations = tracker.update(contacts, now, history, gravity)
+            if radar_observation_practice or not no_debris_test_mode:
+                try:
+                    contacts = GetRadarContacts(RADAR_COUNT)
+                    observations = tracker.update(contacts, now, history, gravity)
+                except Exception as error:
+                    if not obstacle_free_guidance:
+                        raise
+                    if now - last_radar_fault_log > 2.0:
+                        st.logger_warn(f"Radar observation unavailable ({error})")
+                        last_radar_fault_log = now
             if recorder is not None:
                 try:
                     recorder.observations(now, observations)
@@ -508,16 +560,18 @@ while not exit_flag:
                     recorder.close()
                     recorder = None
             nominal = guidance.decide(relative_position, relative_velocity, gravity, now,
-                                       fuel_used, roll_reference, nose=current_axes[0])
+                                       fuel_used, roll_reference, nose=thrust_axis)
+            guidance_tracks = () if obstacle_free_guidance else tracker.tracks.values()
+            guidance_radar_ready = obstacle_free_guidance or tracker.fresh(now)
             route_started = time.perf_counter()
             handoff = LAUNCH_PLAN_TIME <= now < LAUNCH_PLAN_TIME + 2.
-            if ((no_debris_test_mode or tracker.fresh(now)) and not avoidance.active
+            if (guidance_radar_ready and not avoidance.active
                     and (handoff or np.linalg.norm(omega_body) <= MAX_TURN_RAD_S)
                     and nominal.mode in ("ACCELERATE", "CLEAR_COAST")):
                 try:
-                    nominal = routes.command(nominal, guidance, tracker.tracks.values(), now, loc,
+                    nominal = routes.command(nominal, guidance, guidance_tracks, now, loc,
                                              relative_position, relative_velocity, target_vel, gravity,
-                                             roll_reference, current_axes[0], fuel_used, known_empty=no_debris_test_mode)
+                                             roll_reference, thrust_axis, fuel_used, known_empty=obstacle_free_guidance)
                 except Exception as error:
                     # Tactical assessment below can still use the current radar tracks.
                     routes.interrupt(now, "route forecast unavailable")
@@ -527,7 +581,7 @@ while not exit_flag:
             else:
                 routes.interrupt(now, "nominal guidance or tactical priority")
             route_ms = 1000. * (time.perf_counter() - route_started)
-            if not no_debris_test_mode and not tracker.fresh(now):
+            if not guidance_radar_ready:
                 guidance.finish_burn(now)
                 stale = now - tracker.last_fresh > model.radar_timeout
                 nominal.acceleration = np.zeros(3)
@@ -536,14 +590,36 @@ while not exit_flag:
             launch = now < LAUNCH_PLAN_TIME and nominal.mode == "ACCELERATE"
             departure = now < LAUNCH_PLAN_TIME or distance > .90 * guidance.launch_distance
             horizon = guidance.departure_horizon(distance, relative_velocity @ goal) if departure else model.horizon
-            scene = PredictionScene(tracker.tracks.values(), now, loc, vel, gravity, model,
+            scene = PredictionScene(guidance_tracks, now, loc, vel, gravity, model,
                                     horizon=min(horizon, nominal.eta + 1.0), departure=departure,
+                                    lift_axis=current_axes[2] if model.low_tilt else None,
                                     terminal=model.score_cruise and distance <= .30 * guidance.launch_distance)
+            if (bottom_lift and nominal.mode == "ACCELERATE" and routes.action is None
+                    and routes.pending is None and routes.search is None and routes.direct_risk.clearance >= 0.
+                    and not avoidance.active and not scene.tracks):
+                # The broad-phase radar bound covers all candidate burns. Use
+                # the body lift axis only in a clear corridor and on a direct leg.
+                demand = np.linalg.norm(nominal.acceleration)
+                # With a newly acquired radar field, preserve the tested pad
+                # departure through one hull diameter, or until three reliable
+                # fixes resolve each track. Both profiles thrust from launch.
+                departure_known = (obstacle_free_guidance
+                                   or guidance.launch_distance - distance >= 2. * model.ship_radius
+                                   or (guidance_tracks and all(tr.reliable_hits >= 3 for tr in guidance_tracks)))
+                if (departure_known and demand > 0.
+                        and lift_direction @ nominal.acceleration >= demand * math.cos(math.radians(8.))
+                        and (relative_velocity @ goal <= 0. or lift_direction @ relative_velocity >= 0.)):
+                    if now < LAUNCH_PLAN_TIME:
+                        aim = departure_burn_direction(relative_position, relative_velocity,
+                                                       central_gravity + lift_residual, now, model)
+                        pad_target_axes = low_tilt_target(launch_axes, aim, BOTTOM_LIFT_BIAS_DEG)
+                    nominal.acceleration = demand * lift_direction
+                    bottom_burn = True
             # Pad lift is expressed in world axes and already works during the
             # initial turn. Rear-only burns need the stricter attitude limit.
             turn_limit = (2. if launch else 1.) * MAX_TURN_RAD_S
             plan = avoidance.choose(scene, nominal.acceleration, relative_velocity, goal, now,
-                                    nose=current_axes[0], allow_forward=(nominal.mode not in ("ACQUIRE", "SENSOR_COAST")
+                                    nose=thrust_axis, allow_forward=(nominal.mode not in ("ACQUIRE", "SENSOR_COAST")
                                     and np.linalg.norm(omega_body) <= turn_limit),
                                     nominal_burn_seconds=nominal.burn_seconds or 8.,
                                     rear_guidance=not launch and np.linalg.norm(nominal.acceleration) > 0.,
@@ -560,11 +636,12 @@ while not exit_flag:
             command = plan.acceleration.copy()
             mode = nominal.mode if plan.mode == "GUIDANCE" else plan.mode
             quiet_coast = (nominal.mode in ("CLEAR_COAST", "FINAL_COAST", "ROUTE_COAST")
-                           and (no_debris_test_mode or tracker.fresh(now)) and np.linalg.norm(command) < 1e-9
+                           and guidance_radar_ready and np.linalg.norm(command) < 1e-9
                            and plan.encounter.clearance >= 3.)
             if quiet_coast:
                 mode = nominal.mode
         except Exception as error:
+            bottom_burn = False
             guidance.finish_burn(now)
             routes.interrupt(now, "planning fault")
             command = np.zeros(3)
@@ -585,8 +662,8 @@ while not exit_flag:
         guidance.finish_burn(now)
         command = np.zeros(3)
         mode = "ARRIVED"
-    forward_ready = ((no_debris_test_mode or tracker.fresh(now))
-                     and np.linalg.norm(omega_body) <= MAX_TURN_RAD_S)
+    guidance_radar_ready = obstacle_free_guidance or tracker.fresh(now)
+    forward_ready = guidance_radar_ready and np.linalg.norm(omega_body) <= MAX_TURN_RAD_S
     timed_burn = mode in ("TRIM_BURN", "REBOOST") and not mission_complete
     if timed_burn and (not forward_ready or guidance.remaining_burn(now, relative_velocity, gravity) <= 1e-6):
         # Check both elapsed time and observed delivered impulse EVERY control tick,
@@ -595,7 +672,7 @@ while not exit_flag:
         command = np.zeros(3)
         mode, timed_burn = "TRIM_WAIT", False
     angled_launch = (plan is not None and plan.launch_vector and mode == "AVOID" and now < LAUNCH_PLAN_TIME
-                     and now < avoidance_burn_until and tracker.fresh(now)
+                     and now < avoidance_burn_until and guidance_radar_ready
                      and np.linalg.norm(omega_body) <= 2. * MAX_TURN_RAD_S)
     forward_avoidance = (plan is not None and plan.forward_burn and not plan.launch_vector and mode == "AVOID"
                          and now < avoidance_burn_until and not mission_complete
@@ -608,71 +685,97 @@ while not exit_flag:
     # Lift away from the pad before asking for a faster pitch. Evaluate the
     # same measured corridor in both scenarios, including radar freshness.
     clear_departure = (launch_burn and mode == "ACCELERATE" and relative_velocity @ goal > .1
-                       and (no_debris_test_mode or tracker.fresh(now)) and plan is not None
+                       and guidance_radar_ready and plan is not None
                        and plan.baseline.clearance >= 2. * model.clearance)
     pointing_axis = command / max(np.linalg.norm(command), 1e-12) if full_thrust else goal
     nose_error = math.acos(float(np.clip(current_axes[0] @ pointing_axis, -1., 1.)))
-    nose_tolerance = math.radians(2.) if rear_burn else pointing_tolerance(distance, False)
-    if nose_error <= nose_tolerance:
-        alignment_engaged = False
-    elif nose_error > nose_tolerance + math.radians(1. if rear_burn else 4.):
-        alignment_engaged = True
-    # A new contact can arrive mid-slew. If spin currently rules out an angled
-    # escape, damp it first so the next radar decision regains that option.
-    recovery = np.linalg.norm(omega_body) > 2. * MAX_TURN_RAD_S
-    arrest_launch_turn = now < LAUNCH_PLAN_TIME and mode == "AVOID" and recovery
-    # Use a coasting handoff or a blocked forward corridor to finish pointing.
-    align_nose = (alignment_engaged and not quiet_coast and not mission_complete and not vector_escape
-                  and not arrest_launch_turn
-                  and (full_thrust or mode in ("PLAN_COAST", "AVOID")))
-    phase_priority = 1. if align_nose else 0.
-    alignment_priority = alignment_strength(nose_error) * phase_priority
-    reference_accel = (command if full_thrust else goal * model.planning_accel) if align_nose else np.zeros(3)
-    desired_forward = attitude_reference.update(reference_accel, dt, pointing_error=nose_error,
-                                                 priority=phase_priority)
-    target_axes = MakeTargetAttitude(desired_forward, roll_reference)
-    roll_reference = target_axes[1].copy()
-    # At large errors the old slow slew spent extra propellant combining pitch
-    # with broadside lift. Taper the rate with pointing error and keep damping
-    # authority as the nose approaches the burn direction.
-    max_turn_accel = .05 if clear_departure else .03
-    rate_limit = math.radians(3. + (8. if clear_departure else 2.) * alignment_priority)
-    alignment_limit = min(angular_limit, .03 if recovery else
-                          (.005 + (max_turn_accel - .005) * alignment_priority
-                           if full_thrust else (.008 if align_nose else .005)))
-    braking_limit = min(angular_limit, .03 if recovery or full_thrust else (.008 if align_nose else .005))
-    alpha_body, attitude_error = ComputeAttitudeAcceleration(
-        current_axes, target_axes, omega_body, alignment_limit,
-        gain_scale=1.0 + 2.0 * alignment_priority if full_thrust else .75,
-        rate_limit=rate_limit, brake_limit=braking_limit,
-        # Drive into the acceptance cone, then disengage above. Using the same
-        # tolerance for both would approach its boundary asymptotically forever.
-        tolerance=.5 * nose_tolerance)
-    if mission_complete:
-        alpha_body = np.zeros(3)
-    linear_world = np.zeros(3)
-    if vector_escape:
-        linear_world = command.copy()
-    elif launch_burn:
-        # The pad starts broadside. Preserve outward lift while aligning.
-        if no_debris_test_mode or tracker.fresh(now):
-            # Once lift is established on a clear corridor, let the allocator
-            # give more authority to rotation while sustaining outward thrust.
-            lift_request = min(.12, linear_limit) if clear_departure else linear_limit
-            linear_world = (pointing_axis if angled_launch else goal) * lift_request
-    elif rear_burn and forward_ready:
-        axis = current_axes[0]
+    if model.low_tilt:
+        # Translate in the radar-cleared direction with the whole jet array. The
+        # fixed hull reference is independent of both guidance and avoidance.
         route_live = not route_rear or now < routes.action.start + routes.action.duration
-        if route_live:
-            linear_world = rear_thrust(command, axis, goal, relative_velocity)
-    linear_world = limited(linear_world, linear_limit)
-    alpha_command = angular_command(alpha_body, omega_body, np.linalg.norm(linear_world) > 0.,
-                                     ACTUATOR_PERIOD_S, max(alignment_limit, braking_limit), align=align_nose,
-                                     idle_alignment=align_nose)
-    if mission_complete or guidance.distance_coast or (quiet_coast and not recovery):
-        alpha_command = np.zeros(3)
+        spin_ok = np.linalg.norm(omega_body) <= (2. if launch_burn else 1.) * MAX_TURN_RAD_S
+        permit = guidance_radar_ready and spin_ok
+        linear_world = limited(command, linear_limit) if full_thrust and route_live and permit else np.zeros(3)
+        if bottom_burn and mode == "ACCELERATE" and np.any(linear_world):
+            # Follow body +Z during the gentle slew between radar updates.
+            linear_world = np.linalg.norm(linear_world) * lift_direction
+        rotation_error = RotationVector(current_axes @ pad_target_axes.T)
+        attitude_error = float(np.linalg.norm(rotation_error))
+        alignment_limit = braking_limit = min(angular_limit, .012)
+        rate_limit = math.radians(1.2)
+        alignment_priority = 0.
+        desired_rate = limited(rotation_error * (.10 / .75), rate_limit)
+        alpha_command = limited(.75 * (desired_rate - omega_body), alignment_limit)
+        if not np.any(linear_world):
+            alpha_command *= ACTUATOR_PERIOD_S
+        if mission_complete or (attitude_error < math.radians(.15) and np.linalg.norm(omega_body) < math.radians(.004)):
+            alpha_command = np.zeros(3)
+    else:
+        nose_tolerance = math.radians(2.) if rear_burn else pointing_tolerance(distance, False)
+        if nose_error <= nose_tolerance:
+            alignment_engaged = False
+        elif nose_error > nose_tolerance + math.radians(1. if rear_burn else 4.):
+            alignment_engaged = True
+        # A new contact can arrive mid-slew. If spin currently rules out an angled
+        # escape, damp it first so the next radar decision regains that option.
+        recovery = np.linalg.norm(omega_body) > 2. * MAX_TURN_RAD_S
+        arrest_launch_turn = now < LAUNCH_PLAN_TIME and mode == "AVOID" and recovery
+        # Use a coasting handoff or a blocked forward corridor to finish pointing.
+        align_nose = (alignment_engaged and not quiet_coast and not mission_complete and not vector_escape
+                      and not arrest_launch_turn
+                      and (full_thrust or mode in ("PLAN_COAST", "AVOID")))
+        phase_priority = 1. if align_nose else 0.
+        alignment_priority = alignment_strength(nose_error) * phase_priority
+        reference_accel = (command if full_thrust else goal * model.planning_accel) if align_nose else np.zeros(3)
+        desired_forward = attitude_reference.update(reference_accel, dt, pointing_error=nose_error,
+                                                     priority=phase_priority)
+        target_axes = MakeTargetAttitude(desired_forward, roll_reference)
+        roll_reference = target_axes[1].copy()
+        # At large errors the old slow slew spent extra propellant combining pitch
+        # with broadside lift. Taper the rate with pointing error and keep damping
+        # authority as the nose approaches the burn direction.
+        max_turn_accel = .05 if clear_departure else .03
+        rate_limit = math.radians(3. + (8. if clear_departure else 2.) * alignment_priority)
+        alignment_limit = min(angular_limit, .03 if recovery else
+                              (.005 + (max_turn_accel - .005) * alignment_priority
+                               if full_thrust else (.008 if align_nose else .005)))
+        braking_limit = min(angular_limit, .03 if recovery or full_thrust else (.008 if align_nose else .005))
+        alpha_body, attitude_error = ComputeAttitudeAcceleration(
+            current_axes, target_axes, omega_body, alignment_limit,
+            gain_scale=1.0 + 2.0 * alignment_priority if full_thrust else .75,
+            rate_limit=rate_limit, brake_limit=braking_limit,
+            # Drive into the acceptance cone, then disengage above. Using the same
+            # tolerance for both would approach its boundary asymptotically forever.
+            tolerance=.5 * nose_tolerance)
+        if mission_complete:
+            alpha_body = np.zeros(3)
+        linear_world = np.zeros(3)
+        if vector_escape:
+            linear_world = command.copy()
+        elif launch_burn:
+            # The pad starts broadside. Preserve outward lift while aligning.
+            if guidance_radar_ready:
+                # Once lift is established on a clear corridor, let the allocator
+                # give more authority to rotation while sustaining outward thrust.
+                lift_request = min(.12, linear_limit) if clear_departure else linear_limit
+                linear_world = (pointing_axis if angled_launch else goal) * lift_request
+        elif rear_burn and forward_ready:
+            axis = current_axes[0]
+            route_live = not route_rear or now < routes.action.start + routes.action.duration
+            if route_live:
+                linear_world = rear_thrust(command, axis, goal, relative_velocity)
+        linear_world = limited(linear_world, linear_limit)
+        alpha_command = angular_command(alpha_body, omega_body, np.linalg.norm(linear_world) > 0.,
+                                         ACTUATOR_PERIOD_S, max(alignment_limit, braking_limit), align=align_nose,
+                                         idle_alignment=align_nose)
+        if mission_complete or guidance.distance_coast or (quiet_coast and not recovery):
+            alpha_command = np.zeros(3)
     angular_world = current_axes.T @ alpha_command
-    linear_body = st.frames.FramedVector(linear_world, phobosFrame).ExprIn(shuttleFrame)
+    if bottom_burn and mode == "ACCELERATE":
+        # Preserve the allocator request even if the live frame advances during planning.
+        linear_body = np.linalg.norm(linear_world) * lift_body
+    else:
+        linear_body = st.frames.FramedVector(linear_world, phobosFrame).ExprIn(shuttleFrame)
     SetCommand(linear_body, current_axes @ angular_world)
     linear_switches += int((np.linalg.norm(linear_world) > 0.) != (np.linalg.norm(previous_linear_command) > 0.))
     angular_switches += int((np.linalg.norm(angular_world) > 0.) != (np.linalg.norm(previous_angular_command) > 0.))
@@ -688,17 +791,25 @@ while not exit_flag:
         fuel_observer_fuel, fuel_observer_dv, fuel_observer_rotation = fuel_used, 0.0, 0.0
         fuel_observer_on_seconds = 0.0
         encounter = plan.encounter if plan is not None else None
+        hull_rotation_deg = math.degrees(np.linalg.norm(RotationVector(current_axes @ launch_axes.T)))
+        command_magnitude = np.linalg.norm(linear_world)
+        lift_angle = (math.degrees(math.acos(float(np.clip(current_axes[2] @ linear_world / command_magnitude, -1., 1.))))
+                      if command_magnitude > 0. else None)
         st.OnScreenLogMessage(
             f"t={now:6.1f}s {mode:12s} dist={distance:7.1f}m speed={np.linalg.norm(vel):4.1f}m/s "
             f"fuel={fuel_used:6.1f}kg damage={damage:.0f}J tracks={len(tracker.tracks)} "
             f"clearance={encounter.clearance if encounter else math.inf:6.1f}m "
             f"ttc={encounter.time if encounter else math.inf:4.1f}s spin={math.degrees(np.linalg.norm(omega_body)):4.2f}deg/s "
-            f"nose={math.degrees(nose_error):4.1f}deg "
+            f"nose={math.degrees(nose_error):4.1f}deg hull={hull_rotation_deg:.1f}deg "
             f"coast={coast_seconds / max(total_seconds, .01):.0%} plan={planner_ms:.0f}ms",
             "Guidance", st.Severity.Info)
         if recorder is not None:
             values = dict(t=now, mode=mode, distance=distance, speed=np.linalg.norm(vel), closing_speed=relative_velocity @ goal,
                           no_debris_test=int(no_debris_test_mode),
+                          radar_observation_practice=int(radar_observation_practice),
+                          radar_avoidance_enabled=int(not obstacle_free_guidance),
+                          bottom_lift_burn=int(bottom_burn and mode == "ACCELERATE" and command_magnitude > 0.),
+                          thrust_from_lift_axis_deg=lift_angle,
                           fuel=fuel_used, damage=damage, score_if_arrived=model.score(now, fuel_used, damage),
                           eta=nominal.eta if nominal else math.inf,
                           full_thrust=int(full_thrust), coast_speed=model.coast_speed,
@@ -744,7 +855,9 @@ while not exit_flag:
                           braking=int(float(linear_world @ relative_velocity) < -.001),
                           angular_command_norm=float(np.linalg.norm(alpha_command)),
                           nose_error_deg=math.degrees(nose_error), alignment_priority=alignment_priority,
-                          nose_tolerance_deg=math.degrees(nose_tolerance), quiet_coast=int(quiet_coast),
+                          hull_rotation_deg=hull_rotation_deg,
+                          nose_tolerance_deg=None if model.low_tilt else math.degrees(nose_tolerance),
+                          quiet_coast=int(quiet_coast),
                           coast_entry_s=nominal.coast_entry if nominal else math.inf,
                           angular_accel_limit=alignment_limit, angular_brake_limit=braking_limit,
                           tracks=len(tracker.tracks), confirmed=sum(track.hits >= 2 for track in tracker.tracks.values()),

@@ -10,7 +10,8 @@ from FlightRecorder import FlightRecorder
 from Guidance import (MissionModel, StateHistory, RadarTracker, DebrisTrack,
                       AccelerationGuidance, PredictionScene, AvoidancePlanner,
                       PulseController, AccelerationAttitude, travel_time, learn_burn_model,
-                      alignment_strength, angular_command, ballistic_entry, pointing_tolerance)
+                      alignment_strength, angular_command, ballistic_entry, pointing_tolerance,
+                      departure_burn_direction)
 
 
 @dataclass
@@ -149,6 +150,19 @@ class PredictionTests(unittest.TestCase):
     def scene(self, tracks):
         return PredictionScene(tracks, 0., np.zeros(3), np.zeros(3), np.zeros(3), self.model)
 
+    def test_low_tilt_forecast_prices_translation_along_the_actual_lift_axis(self):
+        model = MissionModel(low_tilt=True, process_accel_sigma=0.)
+        zero, up, sideways = np.zeros(3), np.array([1., 0., 0.]), np.array([0., 1., 0.])
+        def assess(lift_axis, nose):
+            scene = PredictionScene([track([48., 0., 0.], zero)], 0., zero, zero, zero,
+                                    model, horizon=20., lift_axis=lift_axis)
+            return scene.assess(.12 * up, 16., initial_direction=nose)
+        direct = assess(up, up)
+        self.assertGreater(direct.clearance, 0.)
+        self.assertEqual(direct, assess(up, sideways))
+        self.assertLess(assess(sideways, up).hull_gap, 0.)
+        self.assertEqual(assess(None, up), assess(sideways, up))
+
     def test_detects_crossing_motion_that_is_not_on_current_nose_line(self):
         scene = self.scene([track([30., 60., 0.], [-2., -4., 0.])])
         encounter = scene.assess(np.zeros(3))
@@ -214,6 +228,20 @@ class PredictionTests(unittest.TestCase):
 
 
 class GuidanceTests(unittest.TestCase):
+    def test_departure_burn_aim_accounts_for_cross_drift_and_target_relative_velocity(self):
+        model = MissionModel()
+        r = np.array([0., 0., 1300.])
+        v = np.array([.04, 0., 0.])
+        g = np.array([0., -.0015, -.01])
+        aim = departure_burn_direction(r, v, g, 1., model)
+        self.assertLess(aim[0], 0.)
+        self.assertGreater(aim[1], 0.)
+        self.assertGreater(aim[2], .99)
+        self.assertAlmostEqual(np.linalg.norm(aim), 1.)
+        rotate = np.array([[0., 0., 1.], [1., 0., 0.], [0., 1., 0.]])
+        np.testing.assert_allclose(departure_burn_direction(rotate @ r, rotate @ v, rotate @ g, 1., model),
+                                   rotate @ aim)
+
 
 
     def test_ballistic_entry_handles_straight_and_offset_intercepts(self):

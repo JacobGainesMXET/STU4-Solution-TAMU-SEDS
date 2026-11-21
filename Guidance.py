@@ -36,6 +36,45 @@ def rear_thrust(request, nose, goal, velocity):
     return magnitude * nose
 
 
+# A small forward component lets the installed allocator sustain stronger +Z
+# thrust with almost all propellant going through the bottom jets.
+BOTTOM_LIFT_BIAS_DEG = .05
+
+
+def low_tilt_target(launch_axes, goal, nose_bias_deg=1.):
+    """Bring the shuttle's +Z axis toward the departure corridor with a small tilt."""
+    local = launch_axes @ goal
+    # Slight nose-up bias leaves a small positive-X translation component.
+    # On the installed asymmetric jet layout that improves vertical authority.
+    horizontal = local[:2] - np.array([math.sin(math.radians(nose_bias_deg)), 0.])
+    length = np.linalg.norm(horizontal)
+    if length < 1e-10:
+        return launch_axes.copy()
+    angle = min(math.atan2(length, local[2]), math.radians(7.5))
+    # Rows of the rotation give the desired body axes in launch coordinates.
+    x, y = horizontal / length
+    skew = np.array([[0., 0., -x], [0., 0., -y], [x, y, 0.]])
+    return (np.eye(3) + math.sin(angle)*skew + (1. - math.cos(angle))*(skew @ skew)) @ launch_axes
+
+
+def departure_burn_direction(r, v, gravity, now, model):
+    """Direction of the best priced straight burn followed by ballistic entry."""
+    # For arrival after T, a burn lasting b adds a*b*(T-b/2) metres.
+    # Aim at the near edge of the capture sphere along the required impulse.
+    times = np.arange(8., 601., 4.)
+    offset = r - times[:, None] * v - .5 * times[:, None]**2 * gravity
+    travel = np.maximum(0., np.linalg.norm(offset, axis=1) - (model.success_radius - 8.))
+    authority = model.planning_accel
+    discriminant = times**2 - 2. * travel / authority
+    feasible = discriminant >= 0.
+    if not np.any(feasible):
+        return unit(r)
+    times, travel = times[feasible], travel[feasible]
+    impulse = 2. * travel / (times + np.sqrt(discriminant[feasible]))
+    value = model.nominal_time / (now + times) - model.fuel_per_dv * impulse / model.nominal_fuel
+    return unit(offset[feasible][np.argmax(value)], unit(r))
+
+
 def nonbraking(acceleration, velocity, goal):
     """Preserve forward progress and allow corrections perpendicular to the flight path."""
     axis = unit(goal)
@@ -73,6 +112,8 @@ class MissionModel:
     avoidance_turn_delay: float = 3.              # allow time for damped attitude response
     arrival_target: float | None = None  # absolute mission seconds, optional time-directed cruise
     score_cruise: bool = False
+    low_tilt: bool = False
+    bottom_lift: bool = False
 
     def score(self, elapsed, fuel, damage=0.):
         time_score = self.nominal_time / elapsed if elapsed > 0. else 0.
@@ -783,10 +824,13 @@ class PredictionScene:
     Unconfirmed tracks use an 8 s horizon while their transverse velocity is unknown.
     """
     def __init__(self, tracks, now, ship_position, ship_velocity, gravity, model, horizon=None,
-                 departure=False, terminal=False):
+                 departure=False, terminal=False, lift_axis=None):
         self.model = model
+        self.lift_axis = lift_axis
         self.tracks = list(tracks)
         self.departure = departure
+        self.moving_departure = (model.low_tilt and departure and lift_axis is not None
+                                 and ship_velocity @ lift_axis > .5)
         self.launch_lift = departure and now < LAUNCH_PLAN_TIME
         lookahead = 1.5 * model.horizon if departure else model.horizon
         self.times = np.arange(0., min(lookahead, horizon if horizon is not None else lookahead) + .25, .5)
@@ -805,7 +849,7 @@ class PredictionScene:
         self.valid = self.times[None, :] <= np.array([
             min(lookahead, 8. + 8. * (track.hits - 1)) for track in self.tracks])[:, None]
         self.ages = np.array([now - track.time for track in self.tracks])
-        if terminal:
+        if terminal or self.moving_departure:
             # Eight seconds on a new track can leave less than one radar
             # revisit plus the time needed to clear a shuttle radius. Look
             # through the second-hit horizon for closing contacts. Keep that
@@ -824,7 +868,7 @@ class PredictionScene:
         time = self.times[None, :]
         powered = np.minimum(time, FORWARD_LOOKAHEAD)
         maximum_accel = max(model.planning_accel, model.avoidance_accel)
-        if model.score_cruise:
+        if model.score_cruise or model.low_tilt:
             maximum_accel = max(maximum_accel, .25)
         if self.launch_lift:
             maximum_accel = max(maximum_accel, LAUNCH_LIFT_MAX)
@@ -852,21 +896,28 @@ class PredictionScene:
             raise ValueError('Burn exceeds the forward prediction horizon')
         time = self.times
         powered = np.minimum(time, burn_seconds)
+        if self.model.low_tilt:
+            # The jet allocator can change the translation vector without slewing the hull.
+            initial_direction = None
         delayed, instant = burn_displacement(time, acceleration, burn_seconds, initial_direction,
                                              self.model.avoidance_turn_rate, self.model.avoidance_turn_delay)
         magnitude = np.linalg.norm(acceleration)
         speed_bound = magnitude
-        if self.launch_lift and initial_direction is None and magnitude > 1e-9:
-            # The allocator preserves the lift direction, but attitude and torque
-            # change the delivered magnitude. Test the segment between both limits.
-            delayed = instant * min(1., LAUNCH_LIFT_MIN / magnitude)
-            speed_bound = max(magnitude, LAUNCH_LIFT_MAX)
-            instant = instant * (speed_bound / magnitude)
-        elif vector_escape and magnitude > 1e-9:
-            # Body jets can deliver an oblique world command without waiting
-            # for the nose. Bracket the allocated impulse in the forecast.
-            delayed = instant * (min(.05, magnitude) / magnitude)
-            speed_bound = max(.25, magnitude)
+        bounds = None
+        if self.model.low_tilt:
+            # The installed array delivered .085–.145 m/s² within 15° of +Z in
+            # sampled allocations. Widen that interval for prediction and use
+            # the full escape envelope for oblique or unknown directions.
+            near_top = (self.lift_axis is not None
+                        and acceleration @ self.lift_axis > magnitude * math.cos(math.radians(15.)))
+            bounds = (.07, .18) if near_top else (.05, .25)
+        elif self.launch_lift and initial_direction is None:
+            bounds = (LAUNCH_LIFT_MIN, LAUNCH_LIFT_MAX)
+        elif vector_escape:
+            bounds = (.05, .25)
+        if bounds is not None and magnitude > 1e-9:
+            delayed = instant * min(1., bounds[0] / magnitude)
+            speed_bound = max(magnitude, bounds[1])
             instant = instant * (speed_bound / magnitude)
         separation = self.position[:, None, :] + self.velocity[:, None, :] * time[None, :, None]
         separation -= delayed[None, :, :]
@@ -933,7 +984,13 @@ class AvoidancePlanner:
             options.append((nominal, duration, direct))
             side = unit(np.cross(axis, np.eye(3)[np.argmin(np.abs(axis))]))
             other = np.cross(axis, side)
-            for degrees in (6., 12., 20.):
+            wide_escape = self.model.low_tilt and scene.moving_departure
+            angles = (6., 12., 20., 35., 50., 65., 75.) if wide_escape else (6., 12., 20.)
+            for degrees in angles:
+                # Preserve a shallow path when one clears the uncertainty margin.
+                # These are translation angles. The hull keeps its launch reference.
+                if degrees == 35. and any(hit.clearance >= 0. for _, _, hit in options):
+                    break
                 tangent = math.tan(math.radians(degrees))
                 for azimuth in np.arange(8) * math.pi / 4.:
                     tilt = math.cos(azimuth) * side + math.sin(azimuth) * other
@@ -950,7 +1007,9 @@ class AvoidancePlanner:
             # First protect the closest physical pass, even if another track
             # dominates the statistical envelope. A sub-metre change is below
             # the radar position noise. Keep the existing heading on near ties.
-            gap = max(min(hit.hull_gap, self.model.clearance) for _, _, hit in options)
+            gap = max(hit.hull_gap for _, _, hit in options)
+            if not (self.model.low_tilt and scene.moving_departure):
+                gap = min(gap, self.model.clearance)
             minimum_gap = max(0., gap - .25) if gap >= 0. else gap - .25
             pool = [item for item in options if item[2].hull_gap >= minimum_gap]
             margin = max(item[2].clearance for item in pool)

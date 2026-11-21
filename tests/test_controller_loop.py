@@ -29,7 +29,8 @@ class FakeSimulation:
     phobos_mu_km3_s2 = 0.
 
     def __init__(self, failure=None, arrived=False, distance=1300., velocity=None, rotation=None,
-                 radar_period=4., no_debris_test=False, spin=None, stop_at=14.):
+                 radar_period=4., no_debris_test=False, spin=None, stop_at=14., low_tilt=False, bottom_lift=False,
+                 radar_observation_practice=False, straight_flight=False):
         self.now = 0.
         self.stop_at = stop_at
         self.position = np.array([0., 0., -10000.])
@@ -39,6 +40,10 @@ class FakeSimulation:
         self.spin = np.zeros(3) if spin is None else np.array(spin, dtype=float)
         self.radar_period = radar_period
         self.no_debris_test = no_debris_test
+        self.low_tilt = low_tilt
+        self.bottom_lift = bottom_lift
+        self.radar_observation_practice = radar_observation_practice
+        self.straight_flight = straight_flight
         self.radar_reads = 0
         self.command = np.zeros(3)
         self.angular = np.zeros(3)
@@ -46,6 +51,7 @@ class FakeSimulation:
         self.arrived = arrived
         self.commands = []
         self.messages = []
+        self.log_messages = []
         self.zero_time = datetime.datetime(2026, 1, 1)
 
     def sleep(self, dt):
@@ -60,8 +66,16 @@ class FakeSimulation:
         return SimpleNamespace(as_datetime=lambda: self.zero_time + datetime.timedelta(seconds=self.now))
 
     def get_param(self, kind, key):
+        if key == 'LowTiltTestMode':
+            return self.low_tilt
+        if key == 'BottomLiftTestMode':
+            return self.bottom_lift
         if key == 'NoDebrisTestMode':
             return self.no_debris_test
+        if key == 'RadarObservationPractice':
+            return self.radar_observation_practice
+        if key == 'StraightFlight':
+            return self.straight_flight
         if key == ['Time', 'StartDateTAI']:
             return SimpleNamespace(as_datetime=lambda: self.zero_time)
         if key == 'LoopFreqHz':
@@ -118,12 +132,17 @@ class FakeSimulation:
                              SimGlobals=SimpleNamespace(GetSimEntity=lambda: SimpleNamespace(GetParam=self.get_param),
                                                         SimClock=SimpleNamespace(GetTimeNow=self.timestamp)),
                              OnScreenLogMessage=lambda message, *args: self.messages.append(message),
+                             logger_info=self.log_messages.append, logger_warn=self.log_messages.append,
                              Severity=SimpleNamespace(Info=0, Warning=1), leave_sim=lambda: None)
         with tempfile.TemporaryDirectory() as directory:
             namespace = dict(np=np, npt=npt, os=os, datetime=datetime, st=st,
                              time=SimpleNamespace(sleep=self.sleep, perf_counter=lambda: self.now),
                              this=SimpleNamespace(GetParam=self.get_param,
-                                                  HasParam=lambda key: key == 'NoDebrisTestMode' and self.no_debris_test),
+                                                  HasParam=lambda key: ((key == 'NoDebrisTestMode' and self.no_debris_test)
+                                                                        or (key == 'LowTiltTestMode' and self.low_tilt)
+                                                                        or (key == 'BottomLiftTestMode' and self.bottom_lift)
+                                                                        or (key == 'RadarObservationPractice' and self.radar_observation_practice)
+                                                                        or (key == 'StraightFlight' and self.straight_flight is not None))),
                              shuttle=shuttle, phobos=SimpleNamespace(GetParam=lambda *args: self.phobos_mu_km3_s2),
                              target=SimpleNamespace(getLocVelAcc=self.target_state),
                              phobosFrame=0, shuttleFrame=1, GetRadarContacts=self.radar,
@@ -145,6 +164,116 @@ class FakeSimulation:
 
 
 class ControllerLoopTests(unittest.TestCase):
+    def test_practice_records_blocking_radar_contacts_and_follows_the_clear_flight(self):
+        from test_guidance import Sample
+
+        class BlockedLane(FakeSimulation):
+            def radar(self, count):
+                self.radar_reads += 1
+                relative = np.array([12., 0., -10000.]) - self.position
+                distance = np.linalg.norm(relative)
+                rate = -self.velocity @ relative / distance
+                return [Sample(relative, distance - 4., rate, 8., self.now)]
+
+        pad = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+        params = dict(rotation=pad, bottom_lift=True, stop_at=6.)
+        empty = FakeSimulation(no_debris_test=True, **params)
+        empty.run()
+        practice = BlockedLane(radar_observation_practice=True, **params)
+        with patch.object(FlightRecorder, 'observations', autospec=True) as record:
+            result = practice.run()
+        self.assertGreater(practice.radar_reads, 0)
+        self.assertTrue(result['tracker'].tracks)
+        self.assertFalse(result['scene'].tracks)
+        self.assertTrue(any(call.args[2] for call in record.call_args_list))
+        np.testing.assert_array_equal([np.r_[t, a, b] for t, a, b in practice.commands],
+                                      [np.r_[t, a, b] for t, a, b in empty.commands])
+        submission = BlockedLane(rotation=pad, stop_at=6., straight_flight=None)
+        submission_result = submission.run()
+        self.assertTrue(submission_result['model'].bottom_lift)
+        self.assertTrue(submission_result['tracker'].tracks)
+        self.assertFalse(submission_result['radar_observation_practice'])
+        self.assertTrue(any('Straight-flight strategy active.' in line for line in submission.log_messages))
+        np.testing.assert_array_equal([np.r_[t, a, b] for t, a, b in submission.commands],
+                                      [np.r_[t, a, b] for t, a, b in practice.commands])
+        regular = BlockedLane(**params)
+        regular.run()
+        self.assertTrue(any(' AVOID ' in line for line in regular.messages))
+        self.assertTrue(any('Radar observation practice active.' in line for line in practice.log_messages))
+        self.assertTrue(any(line.startswith('t=') and 'ACCELERATE' in line for line in practice.messages))
+        self.assertFalse(any('practice' in line.casefold() for line in practice.messages))
+
+    def test_observation_radar_failure_does_not_interrupt_nominal_guidance(self):
+        for modes in (dict(radar_observation_practice=True), dict(straight_flight=None)):
+            with self.subTest(modes=modes):
+                sim = FakeSimulation(failure='radar', stop_at=1., **modes)
+                result = sim.run()
+                self.assertEqual(result['mode'], 'ACCELERATE')
+                self.assertGreater(sim.radar_reads, 0)
+                self.assertTrue(any('Radar observation unavailable' in line for line in sim.log_messages))
+                self.assertFalse(any('Radar observation unavailable' in line for line in sim.messages))
+                self.assertTrue(all(np.any(linear) for _, linear, _ in sim.commands))
+
+    def test_bottom_lift_uses_lift_jets_from_first_clear_tick_and_yields_to_avoidance(self):
+        pad = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+        sim = FakeSimulation(rotation=pad, bottom_lift=True, no_debris_test=True, stop_at=1.)
+        state = sim.run()
+        self.assertTrue(state['bottom_burn'])
+        for _, body, _ in sim.commands:
+            self.assertGreater(body[2], 0.)
+            self.assertAlmostEqual(body[0] / body[2], np.tan(np.radians(.05)), places=7)
+            self.assertAlmostEqual(body[1], 0.)
+        dodge = np.array([.095, .03, 0.])
+        plan = AvoidanceDecision(dodge, 'AVOID', Encounter(clearance=2.), Encounter(hull_gap=-1.),
+                                 forward_burn=True, burn_seconds=1., launch_vector=True)
+        sim = FakeSimulation(rotation=pad, bottom_lift=True, radar_period=.5, stop_at=1.)
+        sim.run(avoidance_decision=plan)
+        for _, body, _ in sim.commands:
+            np.testing.assert_allclose(pad @ body, dodge)
+
+    def test_bottom_lift_respects_blind_launch_and_quiet_coast(self):
+        for sim in (FakeSimulation(bottom_lift=True, failure='empty'),
+                    FakeSimulation(bottom_lift=True, distance=100., velocity=[8., 0., 0.],
+                                   no_debris_test=True, stop_at=.2)):
+            sim.run()
+            self.assertTrue(all(not np.any(linear) for _, linear, _ in sim.commands))
+
+    def test_bottom_lift_preserves_pad_launch_while_radar_tracks_mature(self):
+        pad = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+        for stop, expected in [(.25, False), (1.75, True)]:
+            sim = FakeSimulation(rotation=pad, bottom_lift=True, radar_period=.5, stop_at=stop)
+            state = sim.run()
+            self.assertEqual(state['bottom_burn'], expected)
+            self.assertTrue(all((pad @ linear)[0] > 0. for _, linear, _ in sim.commands))
+
+    def test_low_tilt_translates_on_first_tick_and_after_launch_with_broadside_nose(self):
+        rotation = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+        sim = FakeSimulation(rotation=rotation, low_tilt=True, radar_period=.5, stop_at=26.)
+        state = sim.run()
+        self.assertTrue(state['model'].low_tilt)
+        first = rotation @ sim.commands[0][1]
+        self.assertGreater(first[0], 0.)
+        self.assertLess(np.linalg.norm(first[1:]), .01 * first[0])
+        self.assertTrue(any((rotation @ linear)[0] > 0. for t, linear, _ in sim.commands if t > 22.))
+        self.assertGreater(state['nose_error'], np.radians(80.))
+        self.assertLess(state['attitude_error'], np.radians(8.))
+
+    def test_low_tilt_inhibits_blind_lift_and_clears_commands_at_arrival(self):
+        sim = FakeSimulation(low_tilt=True, failure='empty')
+        sim.run()
+        self.assertTrue(all(not np.any(linear) for _, linear, _ in sim.commands))
+        sim = FakeSimulation(low_tilt=True, arrived=True)
+        sim.run()
+        self.assertTrue(all(not np.any(np.r_[linear, angular]) for _, linear, angular in sim.commands))
+
+    def test_low_tilt_keeps_rate_damping_during_clear_coast(self):
+        sim = FakeSimulation(low_tilt=True, distance=100., velocity=[8., 0., 0.],
+                             spin=[.01, 0., 0.], no_debris_test=True, stop_at=.2)
+        state = sim.run()
+        self.assertTrue(state['quiet_coast'])
+        self.assertTrue(all(not np.any(linear) for _, linear, _ in sim.commands))
+        self.assertTrue(all(angular @ sim.spin < 0. for _, _, angular in sim.commands))
+
     def test_confirmed_vector_escape_is_allocated_in_world_direction(self):
         sim = FakeSimulation(velocity=[5., 0., 0.], radar_period=.5, stop_at=51.)
         sim.now = 50.

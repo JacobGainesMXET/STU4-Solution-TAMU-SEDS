@@ -8,8 +8,10 @@ from pathlib import Path
 
 
 class FlightRecorder:
-    fields = ('t', 'mode', 'no_debris_test', 'distance', 'speed', 'closing_speed', 'fuel', 'damage', 'score_if_arrived',
-              'eta', 'full_thrust', 'coast_speed', 'transit_reason', 'coast_arrival_s',
+    fields = ('t', 'mode', 'no_debris_test', 'radar_observation_practice', 'radar_avoidance_enabled',
+              'distance', 'speed', 'closing_speed', 'fuel', 'damage', 'score_if_arrived',
+              'eta', 'full_thrust', 'bottom_lift_burn', 'thrust_from_lift_axis_deg',
+              'coast_speed', 'transit_reason', 'coast_arrival_s',
               'speed_cutoff_reached', 'velocity_error_deg',
               'guidance_burn_s', 'guidance_burn_plans', 'reburn_advantage',
               'route', 'route_reason', 'cruise_reason', 'launch_burn', 'clear_departure', 'turn_rate_limit_deg_s',
@@ -30,7 +32,7 @@ class FlightRecorder:
               'tracks', 'confirmed', 'radar_age',
               'rejected', 'ambiguous', 'threat_id', 'ttc', 'cpa_time', 'predicted_miss',
               'clearance', 'uncertainty', 'threat_age', 'baseline_clearance', 'hull_gap', 'baseline_hull_gap', 'candidates',
-              'attitude_error_deg', 'spin_deg_s', 'linear_on', 'angular_on', 'linear_switches',
+              'attitude_error_deg', 'hull_rotation_deg', 'spin_deg_s', 'linear_on', 'angular_on', 'linear_switches',
               'angular_switches', 'coast_fraction', 'fuel_per_dv', 'planning_accel', 'planner_ms',
               'x', 'y', 'z', 'vx', 'vy', 'vz', 'gx', 'gy', 'gz',
               'nose_x', 'nose_y', 'nose_z',

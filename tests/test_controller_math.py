@@ -12,7 +12,7 @@ import unittest
 
 import numpy as np
 import numpy.typing as npt
-from Guidance import PulseController
+from Guidance import PulseController, low_tilt_target
 
 
 def load_helpers():
@@ -52,6 +52,20 @@ def contact(position, range_rate=-8., diameter=2.):
 
 
 class AttitudeChecks(unittest.TestCase):
+    def test_low_tilt_reference_limits_full_rotation_in_launch_coordinates(self):
+        pad = active_rotation([.6, .2, -.4]).T
+        for local_goal in ([1., 0., 0.], [0., 0., -1.], [0., 0., 1.], [-.062, -.041, .997]):
+            goal = np.array(local_goal) / np.linalg.norm(local_goal)
+            ref = low_tilt_target(pad, pad.T @ goal)
+            angle = np.linalg.norm(CONTROL["RotationVector"](pad @ ref.T))
+            self.assertLessEqual(math.degrees(angle), 7.5 + 1e-9)
+            np.testing.assert_allclose(ref @ ref.T, np.eye(3), atol=1e-12)
+            self.assertAlmostEqual(np.linalg.det(ref), 1.)
+        # At the final-scene launch pose the nose rises slightly and the
+        # thrust axis stays nearly parallel to the departure corridor.
+        self.assertGreater(ref[0] @ pad[2], 0.)
+        self.assertGreater(ref[2] @ (pad.T @ goal), math.cos(math.radians(2.)))
+
     def test_perpendicular_axes_even_when_roll_reference_is_parallel(self):
         rng = np.random.default_rng(42)
         cases = [(np.array([0., 1., 0.]), np.array([0., -1., 0.]))]
